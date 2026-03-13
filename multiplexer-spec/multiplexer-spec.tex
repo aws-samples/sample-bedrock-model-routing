@@ -1,0 +1,421 @@
+\documentclass[10pt,letterpaper]{article}
+
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\lstset{basicstyle=\ttfamily\small, columns=fullflexible, keepspaces=true,
+  language={}, mathescape=true, literate={->}{$\to$}2 {>=}{$\ge$}1 {<=}{$\le$}1 {!=}{$\ne$}1}
+
+\newcommand{\op}[1]{\textsc{#1}}
+\newcommand{\cls}[1]{\texttt{#1}}
+\newcommand{\fn}[1]{\texttt{#1}}
+\newcommand{\fld}[1]{\texttt{#1}}
+
+\definecolor{coreblue}{HTML}{1565C0}
+\definecolor{modelgreen}{HTML}{2E7D32}
+\definecolor{utilorange}{HTML}{E65100}
+\definecolor{typepurple}{HTML}{7B1FA2}
+\definecolor{errorred}{HTML}{C62828}
+\definecolor{healthteal}{HTML}{00695C}
+\definecolor{tracebrown}{HTML}{795548}
+
+\title{Amazon Bedrock Model Multiplexer --- Specification \\ \large Weighted Routing of Converse API Requests to Model Pools}
+\author{Implementation-Agnostic Behavioral Specification}
+\date{}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+
+\section*{Overview}
+
+The \textbf{Amazon Bedrock Model Multiplexer} routes Amazon Bedrock Converse API requests across a pool of models using weighted random selection, per-model circuit breakers, cross-model retry with failover, and real-time health monitoring. The system comprises five logical subsystems:
+
+\begin{enumerate}[nosep]
+  \item \textbf{Multiplexer} --- orchestrator: owns model pools, delegates to the Request Handler, publishes events
+  \item \textbf{Request Handler} --- per-request state machine: retry loop with cross-model failover
+  \item \textbf{Model Wrapper} --- model adapter: stamps \fld{modelId}, enforces timeout, records circuit breaker outcomes
+  \item \textbf{Circuit Breaker / Circuit Breaker Manager} --- per-model three-state breaker (Closed $\to$ Open $\to$ Half-Open)
+  \item \textbf{Utilities} --- weighted selection, error classification, health checks, validation, tracing, timers
+\end{enumerate}
+
+\medskip
+\noindent\textbf{Invariants:}
+\begin{itemize}[nosep]
+  \item Every model pool has $\ge 1$ primary (non-fallback) model.
+  \item Model IDs are unique across all pools.
+  \item A single Circuit Breaker Manager is the source of truth for all breaker state.
+  \item The multiplexer does not mutate the caller's input beyond stamping \fld{modelId}.
+\end{itemize}
+
+%% ============================================================
+\section*{{\color{typepurple}Data Model}}
+
+The multiplexer operates on the Amazon Bedrock Converse API request and response structures. The caller provides a complete Converse request \emph{except} \fld{modelId}, which the multiplexer stamps based on routing decisions.
+
+\subsection*{{\color{typepurple}Core Data Types}}
+
+\begin{tabular}{@{}l l p{7.5cm}@{}}
+\toprule
+\textbf{Type} & \textbf{Kind} & \textbf{Purpose} \\
+\midrule
+\cls{MultiplexerInput} & Record & Converse API request with all fields except \fld{modelId} (stamped by multiplexer) \\
+\cls{MultiplexerConfig} & Record & Top-level configuration: model list, timeout, max retries, tracing, circuit breaker settings \\
+\cls{ModelConfiguration} & Record & Per-model config: \fld{modelId} (string), \fld{weight} (number), \fld{isFallback} (boolean) \\
+\cls{MultiplexerStats} & Record & Aggregate stats: success/rateLimit/failFast counts + latency metrics \\
+\cls{ModelStats} & Record & Per-model stats: counts + averageLatency \\
+\cls{LatencyMetrics} & Record & Percentiles: average, p50, p95, p99, min, max \\
+\cls{ModelOutcome} & Record & Result of one invocation: modelId, outcomeType, latency, timestamp \\
+\cls{ErrorResponse} & Record & Standardized error: code, message, details \\
+\cls{EnhancedErrorResponse} & Record & Extends ErrorResponse with: errorType, retryable flag, retryAfterMs, recoverySuggestions \\
+\cls{SelectModelRequest} & Record & Input to model selection: set of skipped model IDs \\
+\cls{SelectModelResponse} & Record & Output: selected modelId (nullable) + isFallback flag \\
+\cls{ModelHealthStatus} & Record & Per-model health: circuitState, errorRate, requestsPerMinute \\
+\cls{SystemHealthStatus} & Record & System-wide: healthy/degraded/unhealthy counts + aggregate metrics \\
+\cls{ValidationResult} & Record & isValid flag + list of validation errors \\
+\cls{CircuitBreakerConfig} & Record & failureThreshold, recoveryTimeMs, successThreshold, failureWindowMs \\
+\cls{CircuitBreakerStatus} & Record & state, failureCount, successCount, lastOpenedAt, nextRetryAt \\
+\bottomrule
+\end{tabular}
+
+\subsection*{{\color{typepurple}Enumerations}}
+
+\begin{tabular}{@{}l l p{7.5cm}@{}}
+\toprule
+\textbf{Enum} & \textbf{Values} & \textbf{Semantics} \\
+\midrule
+\cls{OutcomeType} & \texttt{SUCCESS}, \texttt{RATE\_LIMIT}, \texttt{FAIL\_FAST} & Tri-state classification of every invocation attempt \\
+\cls{CircuitBreakerState} & \texttt{CLOSED}, \texttt{OPEN}, \texttt{HALF\_OPEN} & Three-state circuit breaker FSM \\
+\cls{ErrorType} & \op{Validation}, \op{Throttling}, \op{ModelUnavailable}, \op{Timeout}, \op{Cancelled}, \op{CircuitOpen}, \op{Internal}, \op{Authentication}, \op{Network}, \op{Unknown} & 10-variant error taxonomy for diagnostics \\
+\bottomrule
+\end{tabular}
+
+%% ============================================================
+\section*{{\color{coreblue}Multiplexer (Orchestrator)}}
+
+The Multiplexer is the top-level entry point. It owns two model pools (primary and fallback), a Circuit Breaker Manager, a Health Check Manager, and an optional Tracer. It publishes typed events via an observer/event-emitter pattern (see Event System section).
+
+\smallskip
+\begin{tabular}{@{}l l p{6.5cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{Inputs / Outputs} & \textbf{Semantics} \\
+\midrule
+\fn{construct} & config $\to$ Multiplexer & Validate config, initialize subsystems, register models \\
+\fn{addModel} & ModelConfiguration $\to$ void & Create Model Wrapper with shared breaker, add to appropriate pool \\
+\fn{removeModel} & modelId $\to$ void & Destroy model, remove from pool/health/breaker \\
+\fn{processRequest} & MultiplexerInput $\to$ ConverseResponse & Create Request Handler, delegate, trace, emit events \\
+\fn{selectModel} & SelectModelRequest $\to$ SelectModelResponse & Primary pool first, then fallback; weighted random; skip open breakers \\
+\fn{getModel} & modelId $\to$ ModelWrapper or null & Lookup in primary then fallback pool \\
+\fn{reportOutcome} & ModelOutcome $\to$ void & Update stats, record latency, update health, emit events \\
+\fn{getStats} & $\to$ MultiplexerStats & Aggregate across all models + latency percentiles \\
+\fn{resetStats} & $\to$ void & Zero all counters, clear latency history \\
+\fn{getHealthStatus} & $\to$ SystemHealthStatus & Delegate to Health Check Manager \\
+\fn{isHealthy} & $\to$ boolean & True if healthyCount $> 0$ and unhealthyCount $< \max(1, \lfloor n/2 \rfloor)$ \\
+\fn{destroy} & $\to$ void & Destroy all models, clear breakers, remove listeners \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Delegate interface} --- The Request Handler communicates with the Multiplexer through a narrow interface of four operations: \fn{selectModel}, \fn{getModel}, \fn{reportOutcome}, and \fn{emitEvent}. This decouples the retry logic from the orchestrator.
+
+\medskip
+\noindent\textbf{Model selection algorithm} (\fn{selectFromPool}):
+\begin{enumerate}[nosep]
+  \item Filter out models in the \fld{skippedModels} set (already tried for this request).
+  \item Filter out models where the circuit breaker disallows execution; publish \texttt{model-circuit-open-skipped} event.
+  \item Build weighted item list from remaining models.
+  \item Call \fn{weightedRandomSelect} --- returns null if list is empty.
+  \item Try the primary pool first; if null, try the fallback pool.
+\end{enumerate}
+
+\medskip
+\noindent\textbf{Latency percentiles} --- maintained via a ring buffer of the last 1\,000 latencies, sorted on read:
+$$p_k = \text{sorted}[\lfloor n \cdot k \rfloor], \quad k \in \{0.50, 0.95, 0.99\}$$
+
+%% ============================================================
+\section*{{\color{coreblue}Request Handler} \normalfont\small--- per-request state machine}
+
+Each call to \fn{processRequest} creates a fresh Request Handler instance. It communicates with the Multiplexer via the delegate interface described above.
+
+\smallskip
+\noindent\textbf{Retry loop} (\fn{process}):
+\begin{enumerate}[nosep]
+  \item Set $\text{retryCount} \gets 0$, $\text{skippedModels} \gets \emptyset$.
+  \item \textbf{while} $\text{retryCount} \le \text{maxRetries}$:
+  \begin{enumerate}[nosep,label=\alph*.]
+    \item Call \fn{selectModel}(\fld{skippedModels}). If null $\to$ raise error with code \texttt{NO\_MODELS\_AVAILABLE}.
+    \item Call \fn{getModel}(modelId). If null $\to$ add to skipped, increment retry, continue.
+    \item Call \fn{model.invoke}(input). On success $\to$ report outcome, return response.
+    \item On \op{RateLimit} error $\to$ report outcome, add model to skipped, increment retry, continue.
+    \item On \op{CircuitOpen} error $\to$ report outcome, add model to skipped, increment retry, continue.
+    \item On \op{FailFast} error $\to$ raise immediately (no retry).
+    \item On unknown error $\to$ re-raise the original error as-is (no wrapping).
+  \end{enumerate}
+  \item If loop exhausts $\to$ raise error with code \texttt{RETRIES\_EXHAUSTED}.
+\end{enumerate}
+
+%% ============================================================
+\section*{{\color{modelgreen}Model Wrapper} \normalfont\small--- Amazon Bedrock model adapter}
+
+Wraps an Amazon Bedrock runtime client for a single model. Owns: client instance, model configuration, circuit breaker reference, timeout setting.
+
+\smallskip
+\begin{tabular}{@{}l l p{7cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{Inputs / Outputs} & \textbf{Semantics} \\
+\midrule
+\fn{construct} & config, client?, timeoutMs?, breaker?, clientConfig? & Create Bedrock runtime client with \fld{clientConfig} passthrough \\
+\fn{invoke} & input, abortSignal? $\to$ \{response, outcome\} & Stamp modelId, check breaker, execute with timeout \\
+\fn{invokeStream} & input, abortSignal? $\to$ streaming response & Streaming variant via Converse Stream API; returns raw SDK response \\
+\fn{destroy} & $\to$ void & Reset circuit breaker \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Invoke flow}:
+\begin{enumerate}[nosep]
+  \item \fn{circuitBreaker.canExecute()} --- if false, raise \op{CircuitOpenError} with outcome.
+  \item Construct a Converse API call with $\{\ldots\text{input}, \text{modelId}\}$.
+  \item \fn{executeWithTimeout}(operation, timeoutMs, abortSignal):
+  \begin{itemize}[nosep]
+    \item Race: operation vs.\ timeout timer vs.\ abort signal.
+    \item First to resolve or reject wins; others are cleaned up.
+  \end{itemize}
+  \item On success $\to$ \fn{breaker.recordSuccess()}, return \op{Success} outcome.
+  \item On abort/cancellation $\to$ return \op{FailFast} outcome (no breaker recording).
+  \item On timeout $\to$ \fn{breaker.recordFailure()}, return \op{FailFast} outcome.
+  \item On throttling error $\to$ \fn{breaker.recordFailure()}, raise \op{RateLimitError} with outcome.
+  \item On other error $\to$ \fn{breaker.recordFailure()}, raise \op{FailFastError} with outcome.
+\end{enumerate}
+
+\medskip
+\noindent\textbf{Streaming} --- \fn{invokeStream} returns the raw streaming response from the Amazon Bedrock Converse Stream API. No custom iteration, chunk transformation, or token usage extraction is performed by the multiplexer; the caller consumes the stream directly using their platform's streaming primitives.
+
+%% ============================================================
+\section*{{\color{errorred}Circuit Breaker} \normalfont\small--- resilience pattern}
+
+Each model gets a Circuit Breaker instance managed by a single Circuit Breaker Manager. The breaker implements a three-state finite state machine.
+
+\medskip
+\noindent\textbf{Default configuration:}
+\begin{tabular}{@{}l r l@{}}
+\toprule
+\textbf{Parameter} & \textbf{Default} & \textbf{Meaning} \\
+\midrule
+\fld{failureThreshold} & 5 & Recent failures within sliding window to trip OPEN \\
+\fld{recoveryTimeMs} & 30\,000 & Time in OPEN before transitioning to HALF\_OPEN \\
+\fld{successThreshold} & 2 & Successes in HALF\_OPEN to close the circuit \\
+\fld{failureWindowMs} & 60\,000 & Sliding window for counting recent failures \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{State transitions:}
+
+\smallskip
+\begin{tabular}{@{}l l l l@{}}
+\toprule
+\textbf{From} & \textbf{Event} & \textbf{To} & \textbf{Action} \\
+\midrule
+\op{Closed} & recentFailures $\ge$ threshold & \op{Open} & Record \fld{lastOpenedAt}, reset successCount \\
+\op{Closed} & success & \op{Closed} & Clear failure history \\
+\op{Open} & $t - \text{lastOpenedAt} \ge \text{recoveryTimeMs}$ & \op{HalfOpen} & Reset successCount (checked lazily on state query) \\
+\op{HalfOpen} & success (count $\ge$ successThreshold) & \op{Closed} & Clear failures, reset counts \\
+\op{HalfOpen} & any failure & \op{Open} & Record new \fld{lastOpenedAt} \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Circuit Breaker Manager} --- collection-level operations:
+\begin{itemize}[nosep]
+  \item \fn{getBreaker}(modelId) --- get-or-create with default config.
+  \item \fn{canExecute}(modelId) --- returns true if breaker allows requests (or breaker doesn't exist yet).
+  \item \fn{getAllStatus}() --- snapshot of all breaker states.
+  \item \fn{removeBreaker}(modelId), \fn{clear}(), \fn{resetAll}() --- lifecycle management.
+\end{itemize}
+
+\noindent\textbf{Failure window cleanup:} on every \fn{recordFailure} and \fn{getRecentFailureCount}, failures older than \fld{failureWindowMs} are pruned from the list.
+
+%% ============================================================
+\section*{{\color{utilorange}Error Classification} \normalfont\small--- error taxonomy}
+
+All AWS SDK errors are classified into two layers: a coarse \cls{OutcomeType} for the retry loop, and a fine \cls{ErrorType} for diagnostics.
+
+\smallskip
+\begin{tabular}{@{}l l p{6.5cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{Inputs / Outputs} & \textbf{Semantics} \\
+\midrule
+\fn{classifyError} & error $\to$ OutcomeType & Throttling errors $\to$ \op{RateLimit}; everything else $\to$ \op{FailFast} \\
+\fn{classifyErrorType} & error $\to$ ErrorType & Fine-grained 10-variant classification by error name/message \\
+\fn{isThrottlingError} & errorName $\to$ boolean & Matches 6 throttling error names (see below) \\
+\fn{toErrorResponse} & error $\to$ ErrorResponse & Normalize to \{code, message, details\} \\
+\fn{createEnhancedError} & error, errorType?, modelId? $\to$ EnhancedErrorResponse & Full diagnostic error with recovery suggestions \\
+\fn{getRecoverySuggestions} & ErrorType $\to$ list of strings & Human-readable recovery advice per error type \\
+\fn{getErrorMessage} & error $\to$ string & User-friendly message by AWS error name \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Throttling error names} (any of these $\to$ \op{RateLimit}):
+
+\smallskip
+\begin{tabular}{@{}l l l@{}}
+\texttt{ThrottlingException} & \texttt{TooManyRequestsException} & \texttt{ServiceQuotaExceededException} \\
+\texttt{LimitExceededException} & \texttt{RequestLimitExceeded} & \texttt{RateLimitExceeded} \\
+\end{tabular}
+
+\medskip
+\noindent\textbf{Failover semantics:} the multiplexer does \emph{not} perform timed retries or backoff. On a recoverable error (\op{RateLimit} or \op{CircuitOpen}), the failing model is skipped and a different model is selected immediately with zero delay. This is cross-model failover, not same-model retry.
+
+%% ============================================================
+\section*{{\color{healthteal}Health Monitoring}}
+
+The Health Check Manager tracks per-model metrics (request timestamps, response times, success/failure counts) in a sliding window (default 60\,s, max 1\,000 entries per model).
+
+\smallskip
+\noindent\textbf{Model health}: a model is \emph{healthy} iff circuit state $\ne$ \op{Open} AND errorRate $< 0.5$.
+
+\smallskip
+\noindent\textbf{System health}:
+\begin{itemize}[nosep]
+  \item \emph{Healthy model}: isHealthy AND circuit = \op{Closed}.
+  \item \emph{Degraded model}: isHealthy AND circuit $\ne$ \op{Closed} (e.g.\ \op{HalfOpen}).
+  \item \emph{Unhealthy model}: not isHealthy.
+  \item System is healthy iff unhealthyCount $< \max(1, \lfloor$totalModels$/2\rfloor)$ AND healthyCount $> 0$.
+  \item The $\max(1, \ldots)$ ensures a single healthy model reports healthy: without it, $\lfloor 1/2 \rfloor = 0$ makes the condition $0 < 0$ (always false).
+\end{itemize}
+
+\smallskip
+\noindent\textbf{Health endpoint} --- a formatter for external consumers should provide:
+\begin{itemize}[nosep]
+  \item \fn{getSimpleHealth}() $\to$ \{\texttt{status}: ``healthy'' or ``unhealthy'', \texttt{code}: 200 or 503\} --- suitable for load balancers.
+  \item \fn{getDetailedHealth}() $\to$ full system snapshot with per-model detail and aggregate metrics (totalRequests, successRate, averageLatencyMs, p99LatencyMs).
+\end{itemize}
+
+%% ============================================================
+\section*{{\color{utilorange}Weighted Selection} \normalfont\small--- model routing}
+
+\begin{tabular}{@{}l l p{6.5cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{Inputs / Outputs} & \textbf{Semantics} \\
+\midrule
+\fn{weightedRandomSelect} & list of (item, weight) $\to$ item or null & Draw one item proportional to weight \\
+\fn{createWeightedItem} & item, weight $\to$ (item, weight) & Constructor helper \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Algorithm:} given items with weights $w_1, \ldots, w_n$, total $W = \sum w_i$:
+$$r \sim \mathcal{U}(0, W); \quad \text{select item } k \text{ where } \sum_{i=1}^{k-1} w_i < r \le \sum_{i=1}^{k} w_i$$
+Returns null if the list is empty or $W \le 0$.
+
+%% ============================================================
+\section*{{\color{tracebrown}Observability}}
+
+\subsection*{Tracing}
+
+The Tracer provides optional distributed tracing (e.g.\ AWS X-Ray). If the tracing backend is unavailable, all operations silently no-op.
+
+\smallskip
+\begin{tabular}{@{}l l p{6.5cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{Inputs / Outputs} & \textbf{Semantics} \\
+\midrule
+\fn{isEnabled} & $\to$ boolean & True iff tracing is configured and the backend is loaded \\
+\fn{putAnnotation} & key, value $\to$ void & Add indexed annotation to current trace segment \\
+\fn{putMetadata} & key, value $\to$ void & Add metadata (only if \fld{captureBodies} is enabled) \\
+\fn{traceOperation} & name, operation, metadata? $\to$ result & Create subsegment, execute, annotate outcome/latency, close \\
+\fn{generateRequestId} & $\to$ string & Unique request identifier (e.g.\ \texttt{req\_\{timestamp\}\_\{random\}}) \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Tracing configuration}: \fld{enabled} (boolean), \fld{serviceName} (default ``bedrock-multiplexer''), \fld{captureBodies} (boolean), \fld{captureModelSelection} (boolean). When \fld{captureModelSelection} is true, model selection gets its own subsegment with skipped/available model counts.
+
+\subsection*{Event System}
+
+The Multiplexer publishes typed events via an observer pattern. Consumers subscribe to events for monitoring, logging, or integration with external systems.
+
+\smallskip
+\begin{tabular}{@{}l l@{}}
+\toprule
+\textbf{Event} & \textbf{Payload} \\
+\midrule
+\texttt{request} & (input) \\
+\texttt{success} & (null, outcome: ModelOutcome) \\
+\texttt{error} & (error: ErrorResponse or null, outcome: ModelOutcome) \\
+\texttt{model-circuit-open-skipped} & (modelId) \\
+\texttt{model-added} / \texttt{model-removed} & (modelId) \\
+\texttt{stats} & (stats: MultiplexerStats) \\
+\texttt{stats-reset} & () \\
+\texttt{model-selected} & (modelId, isFallback, skippedCount) \\
+\texttt{model-invocation-start} & (modelId, requestId) \\
+\texttt{model-invocation-complete} & (modelId, requestId, latencyMs) \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+\noindent\textbf{Implementation note:} ensure that unhandled \texttt{error} events do not cause the process to crash. Register a default no-op handler if your platform's event system raises on unhandled error events.
+
+%% ============================================================
+\section*{{\color{utilorange}Input Validation}}
+
+Three validation scopes, each producing a \cls{ValidationResult} (isValid flag + list of errors):
+
+\smallskip
+\begin{tabular}{@{}l l@{}}
+\toprule
+\textbf{Scope} & \textbf{Key Rules} \\
+\midrule
+Model config & modelId required (non-empty string), weight $\in [0, 10000]$, isFallback required \\
+Multiplexer config & models $\ge 1$, unique IDs, $\ge 1$ primary, timeout $\in [1000, 300000]$\,ms, retries $\in [0, 10]$ \\
+Circuit breaker config & failureThreshold $\in [1, 100]$, recoveryTimeMs $\in [1000, 300000]$, successThreshold $\in [1, 20]$, failureWindowMs $\in [1000, 600000]$ \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent Helper operations: \fn{formatValidationErrors}(result) $\to$ human-readable string; \fn{assertValid}(result) raises on failure.
+
+%% ============================================================
+\section*{{\color{utilorange}Timer} \normalfont\small--- timeout primitive}
+
+A cancellable timeout abstraction with operations: \fn{start}(ms), \fn{cancel}(), \fn{isRunning}(). Calling \fn{start} while running cancels the previous timer first. Implementations should use platform-appropriate timer primitives.
+
+%% ============================================================
+\section*{Request Lifecycle}
+
+End-to-end pseudocode for a single \fn{processRequest} call:
+
+\begin{lstlisting}
+  // 1. Caller invokes multiplexer
+  response = multiplexer.processRequest(input)
+
+  // Internal flow:
+  // 2. Multiplexer creates a new RequestHandler(input, delegate, maxRetries)
+  // 3. RequestHandler.process() enters retry loop:
+  //    a. delegate.selectModel({skippedModels})
+  //       -> selectFromPool(primaryModels, skipped)   // weighted random, skip open breakers
+  //       -> if null: selectFromPool(fallbackModels, skipped)
+  //       -> if null: raise NO_MODELS_AVAILABLE
+  //    b. delegate.getModel(modelId)
+  //    c. model.invoke(input)
+  //       -> check circuitBreaker.canExecute()
+  //       -> Converse API call with {...input, modelId}
+  //       -> race: operation vs timeout vs abort signal
+  //       -> on success: breaker.recordSuccess(), return {response, outcome}
+  //       -> on error:   breaker.recordFailure(), raise typed error with outcome
+  //    d. delegate.reportOutcome(outcome)
+  //       -> updateModelStats(), recordLatency()
+  //       -> healthCheckManager.recordSuccess/Failure()
+  //       -> publish 'success' or 'error' event, publish 'stats' event
+  //    e. On RateLimit or CircuitOpen: skip model, retry with next model
+  //    f. On FailFast: raise to caller immediately
+  // 4. Response returned to caller (or error raised)
+\end{lstlisting}
+
+\end{document}

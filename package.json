@@ -1,0 +1,47 @@
+{
+  "name": "bedrock-model-multiplexer",
+  "version": "1.0.0",
+  "description": "A TypeScript implementation of an Amazon Bedrock Model Multiplexer with weighted routing, retry logic, and statistics tracking",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "jest --testPathIgnorePatterns=integration",
+    "test:watch": "jest --watch --testPathIgnorePatterns=integration",
+    "test:coverage": "jest --coverage --testPathIgnorePatterns=integration",
+    "test:integration": "jest --testPathPatterns=integration --runInBand --config jest.config.js",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "dev": "npm run build && node dist/examples/example.js"
+  },
+  "keywords": [
+    "aws",
+    "bedrock",
+    "multiplexer",
+    "load-balancer",
+    "typescript",
+    "aws-sdk-v3"
+  ],
+  "author": "Amazon Web Services",
+  "license": "MIT",
+  "dependencies": {
+    "@aws-lambda-powertools/tracer": "2.31.0",
+    "@aws-sdk/client-bedrock-runtime": "3.1006.0",
+    "@aws-sdk/client-sts": "3.1006.0",
+    "@aws-sdk/types": "3.973.5",
+    "@smithy/types": "4.13.0",
+    "events": "3.3.0"
+  },
+  "devDependencies": {
+    "@types/jest": "30.0.0",
+    "@types/node": "25.4.0",
+    "@typescript-eslint/eslint-plugin": "8.57.0",
+    "@typescript-eslint/parser": "8.57.0",
+    "dotenv": "17.3.1",
+    "eslint": "10.0.3",
+    "jest": "30.3.0",
+    "ts-jest": "29.4.6",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
+  }
+}

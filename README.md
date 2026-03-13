@@ -1,17 +1,154 @@
-## My Project
+# Amazon Bedrock Model Multiplexer
 
-TODO: Fill this README out!
+A TypeScript client-side facade over the Amazon Bedrock SDK that distributes `ConverseCommand` requests across multiple models using weighted selection, automatic failover, per-model fault isolation, and observability instrumentation.
 
-Be sure to:
+---
 
-* Change the title in this README
-* Edit your repository description on GitHub
+## Overview
 
-## Security
+The multiplexer adds resilience and automatic failover to Amazon Bedrock's Converse API. You configure a pool of models with weights and fallback designations; the multiplexer selects a model, isolates failures with per-model circuit breakers, and retries with a different model when one is throttled or unavailable. Your application sends a standard `ConverseCommandInput` and receives a standard `ConverseCommandOutput`. The failover is transparent.
 
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+![BedrockModelMultiplexer Architecture](multiplexer-spec/diagram.png)
 
-## License
+---
 
-This library is licensed under the MIT-0 License. See the LICENSE file.
+## Quick Start
 
+```typescript
+import { ConverseCommandInput } from '@aws-sdk/client-bedrock-runtime';
+import { createMultiplexer, ModelConfiguration } from 'bedrock-model-multiplexer';
+
+const models: ModelConfiguration[] = [
+  { modelId: 'amazon.nova-2-lite-v1:0', weight: 100, isFallback: false },
+  { modelId: 'amazon.nova-pro-v1:0',    weight: 30,  isFallback: true  }
+];
+
+const multiplexer = createMultiplexer(models, { maxRetries: 3 });
+
+const input: Omit<ConverseCommandInput, 'modelId'> = {
+  messages: [{ role: 'user', content: [{ text: 'Explain quantum computing in simple terms' }] }],
+  inferenceConfig: { maxTokens: 1000, temperature: 0.7 }
+};
+
+const response = await multiplexer.processRequest(input);
+
+multiplexer.destroy();
+```
+
+---
+
+## Configuration
+
+```typescript
+interface MultiplexerConfig {
+  models: ModelConfiguration[];       // Models to register
+  defaultTimeoutMs?: number;          // Per-request timeout in ms (default: 30000)
+  maxRetries?: number;                // Max cross-model retry attempts
+  clientConfig?: Record<string, any>; // Passed through to BedrockRuntimeClient
+                                      // Set maxAttempts: 1 to disable SDK-level retries
+  tracing?: {
+    enabled: boolean;
+    serviceName?: string;
+    captureBodies?: boolean;
+    captureModelSelection?: boolean;
+  };
+}
+```
+---
+
+## Resilience
+
+> **Tip:** Set `clientConfig: { maxAttempts: 1 }` to disable SDK-level retries so the multiplexer can fail over to a different model immediately on throttling.
+
+| Scenario | What happens |
+|---|---|
+| **Throttling** (`ThrottlingException`) | The failing model is skipped and a different model is selected immediately — no delay, no same-model retry. |
+| **Repeated failures** (5 within 60 s) | The model is temporarily removed from rotation for 30 s, then gradually re-introduced. |
+| **Fail-fast errors** (`ValidationException`, etc.) | Request fails immediately; no failover. |
+| **All models unavailable** | `processRequest()` throws `{ code: 'NO_MODELS_AVAILABLE' }`. Models recover automatically once the cool-down period expires. |
+
+---
+
+## Health & Statistics
+
+```typescript
+// Real-time health (suitable for load balancer probes)
+const { status, code } = multiplexer.getSimpleHealthCheck();
+// { status: 'healthy', code: 200 } or { status: 'unhealthy', code: 503 }
+
+// Detailed per-model health
+const health = multiplexer.getHealthStatus();
+// health.isHealthy, health.models[modelId].circuitState, .errorRate, .avgResponseTimeMs
+
+// Cumulative statistics
+const stats = multiplexer.getStats();
+// stats.successCount, .rateLimitCount, .latencyMetrics.p95
+```
+
+---
+
+## Security Considerations
+
+Under the [AWS shared responsibility model](https://aws.amazon.com/compliance/shared-responsibility-model/), AWS is responsible for security of the cloud infrastructure that runs Amazon Bedrock. Customers are responsible for security in the cloud, including credential management, input validation, and content filtering. See [SECURITY.md](./SECURITY.md) for the full security policy.
+
+- AWS credentials are managed entirely by the consuming application (IAM roles, environment variables, credential profiles). The library is designed to avoid reading files from disk or accessing `process.env`.
+- All communication with Amazon Bedrock uses HTTPS/TLS 1.2+ as enforced by the AWS SDK v3.
+- Enable [AWS CloudTrail](https://docs.aws.amazon.com/bedrock/latest/userguide/logging-using-cloudtrail.html) for auditing Amazon Bedrock API calls. Enable [model invocation logging](https://docs.aws.amazon.com/bedrock/latest/userguide/model-invocation-logging.html) for tracking data access patterns.
+- Model IDs and request payloads should be validated before submission.
+- For production workloads, configure [Amazon Bedrock Guardrails](https://docs.aws.amazon.com/bedrock/latest/userguide/guardrails.html). The library forwards requests without inspection.
+
+### Required IAM Permissions
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "bedrock:InvokeModel",
+        "bedrock:InvokeModelWithResponseStream"
+      ],
+      "Resource": [
+        "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0",
+        "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0"
+      ]
+    }
+  ]
+}
+```
+
+Replace the `Resource` ARNs with the specific models used by the application. Avoid `Resource: "*"`. Do not pass hardcoded credentials via `clientConfig`.
+
+---
+
+## Testing
+
+```bash
+npm test
+npm run test:coverage
+```
+
+---
+
+## Related Resources
+
+| Resource | Link |
+|---|---|
+| Amazon Bedrock Documentation | https://docs.aws.amazon.com/bedrock/ |
+| Service Quotas | https://docs.aws.amazon.com/bedrock/latest/userguide/quotas.html |
+| Token-Based Throughput Quotas | https://docs.aws.amazon.com/bedrock/latest/userguide/quotas-token-burndown.html |
+| AWS SDK for JavaScript v3 | https://github.com/aws/aws-sdk-js-v3 |
+| Behavioral Specification | [multiplexer-spec/multiplexer-spec.pdf](./multiplexer-spec/multiplexer-spec.pdf) |
+| Security Policy | [SECURITY.md](./SECURITY.md) |
+| Examples | [src/examples/](./src/examples/) |
+
+Contributing
+------------
+
+- See [CONTRIBUTING.md](./CONTRIBUTING.md) for the full contribution policy.
+
+License
+-------
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
