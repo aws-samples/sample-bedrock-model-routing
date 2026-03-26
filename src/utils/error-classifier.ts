@@ -1,4 +1,4 @@
-import { OutcomeType, ErrorResponse, ErrorType, EnhancedErrorResponse } from '../types/index.js';
+import { OutcomeType, ErrorResponse, ErrorType, EnhancedErrorResponse } from '../types/index';
 
 /**
  * Error classification utilities for Amazon Bedrock SDK errors

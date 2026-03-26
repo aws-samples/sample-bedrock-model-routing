@@ -9,7 +9,7 @@ import {
   ValidationError,
   ValidationResult,
   CircuitBreakerConfig
-} from '../types/index.js';
+} from '../types/index';
 
 /**
  * Validator class for model configurations.
@@ -228,6 +228,66 @@ export class MultiplexerConfigValidator {
           expected: 'object',
           actual: Array.isArray(cfg.clientConfig) ? 'array' : typeof cfg.clientConfig
         });
+      }
+    }
+
+    // Validate refusalDetection (optional)
+    if (cfg.refusalDetection !== undefined && cfg.refusalDetection !== null) {
+      if (typeof cfg.refusalDetection !== 'object' || Array.isArray(cfg.refusalDetection)) {
+        errors.push({
+          field: 'refusalDetection',
+          message: 'refusalDetection must be an object',
+          expected: 'object',
+          actual: Array.isArray(cfg.refusalDetection) ? 'array' : typeof cfg.refusalDetection
+        });
+      } else {
+        const rd = cfg.refusalDetection as Record<string, unknown>;
+        
+        if (rd.enabled !== undefined && typeof rd.enabled !== 'boolean') {
+          errors.push({
+            field: 'refusalDetection.enabled',
+            message: 'enabled must be a boolean',
+            expected: 'boolean',
+            actual: typeof rd.enabled
+          });
+        }
+
+        if (rd.enabled === true) {
+          if (!rd.modelPath || typeof rd.modelPath !== 'string') {
+            errors.push({
+              field: 'refusalDetection.modelPath',
+              message: 'modelPath is required when refusal detection is enabled',
+              expected: 'string'
+            });
+          }
+        }
+
+        if (rd.confidenceThreshold !== undefined && rd.confidenceThreshold !== null) {
+          if (typeof rd.confidenceThreshold !== 'number') {
+            errors.push({
+              field: 'refusalDetection.confidenceThreshold',
+              message: 'confidenceThreshold must be a number',
+              expected: 'number',
+              actual: typeof rd.confidenceThreshold
+            });
+          } else if (rd.confidenceThreshold < 0 || rd.confidenceThreshold > 1) {
+            errors.push({
+              field: 'refusalDetection.confidenceThreshold',
+              message: 'confidenceThreshold must be between 0 and 1',
+              expected: '0–1',
+              actual: String(rd.confidenceThreshold)
+            });
+          }
+        }
+
+        if (rd.retryOnRefusal !== undefined && typeof rd.retryOnRefusal !== 'boolean') {
+          errors.push({
+            field: 'refusalDetection.retryOnRefusal',
+            message: 'retryOnRefusal must be a boolean',
+            expected: 'boolean',
+            actual: typeof rd.retryOnRefusal
+          });
+        }
       }
     }
 

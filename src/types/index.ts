@@ -34,6 +34,8 @@ export interface MultiplexerStats {
   rateLimitCount: number;
   /** Total number of fail-fast errors */
   failFastCount: number;
+  /** Total number of refusal-detected responses */
+  refusalCount: number;
   /** Per-model statistics */
   modelStats: Record<string, ModelStats>;
   /** Overall request latency metrics */
@@ -52,6 +54,8 @@ export interface ModelStats {
   rateLimitCount: number;
   /** Number of fail-fast errors from this model */
   failFastCount: number;
+  /** Number of refusal-detected responses from this model */
+  refusalCount: number;
   /** Average response latency in milliseconds */
   averageLatency: number;
   /** Whether this is a fallback model */
@@ -85,7 +89,9 @@ export enum OutcomeType {
   /** Request was rate-limited (ThrottlingException) */
   RATE_LIMIT = 1,
   /** Request failed fast (other errors) */
-  FAIL_FAST = 2
+  FAIL_FAST = 2,
+  /** Response was classified as a refusal */
+  REFUSAL = 3
 }
 
 /**
@@ -162,6 +168,25 @@ export interface MultiplexerConfig {
     /** Whether to capture detailed model selection traces */
     captureModelSelection?: boolean;
   };
+  /** Refusal detection configuration (opt-in) */
+  refusalDetection?: RefusalDetectionConfig;
+}
+
+/**
+ * Configuration for refusal detection on model responses.
+ * When enabled, model responses are classified by an ONNX binary classifier
+ * to detect refusals (e.g., "I can't help with that"). Detected refusals
+ * trigger automatic retry with a different model.
+ */
+export interface RefusalDetectionConfig {
+  /** Enable refusal detection on model responses */
+  enabled: boolean;
+  /** Path to the .onnx model file */
+  modelPath: string;
+  /** Confidence threshold (0–1) above which a response is classified as refusal (default: 0.5) */
+  confidenceThreshold?: number;
+  /** Whether to retry with a different model on refusal detection (default: true) */
+  retryOnRefusal?: boolean;
 }
 
 
@@ -191,6 +216,10 @@ export interface MultiplexerEvents {
   'model-invocation-start': (modelId: string, requestId: string) => void;
   /** Emitted when a model invocation completes */
   'model-invocation-complete': (modelId: string, requestId: string, latency: number) => void;
+  /** Emitted when a response is classified as a refusal */
+  'refusal-detected': (modelId: string, confidence: number, responseText: string) => void;
+  /** Emitted when refusal classification completes (regardless of result) */
+  'refusal-classification': (modelId: string, isRefusal: boolean, confidence: number, latencyMs: number) => void;
 }
 
 /**

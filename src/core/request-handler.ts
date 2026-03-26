@@ -3,10 +3,11 @@ import {
   OutcomeType,
   SelectModelRequest,
   SelectModelResponse
-} from '../types/index.js';
-import { BedrockModel, MultiplexerInput } from '../models/bedrock-model.js';
+} from '../types/index';
+import { BedrockModel, MultiplexerInput } from '../models/bedrock-model';
 import { ConverseCommandOutput } from '@aws-sdk/client-bedrock-runtime';
-import { MultiplexerError } from './errors.js';
+import { MultiplexerError } from './errors';
+import { extractResponseText } from '../classifiers/response-extractor';
 
 /**
  * RequestHandler manages individual chat requests with retry logic
@@ -80,6 +81,49 @@ export class RequestHandler {
           // Emit model-invocation-complete event (success path)
           const invokeLatency = Date.now() - invokeStartTime;
           this.multiplexer.emitEvent('model-invocation-complete', selection.modelId, this.requestId, invokeLatency);
+
+          // --- REFUSAL DETECTION ---
+          // If refusal detection is enabled, classify the response before returning
+          if (this.multiplexer.refusalRetryEnabled) {
+            const responseText = extractResponseText(result.response);
+            const classification = await this.multiplexer.classifyRefusal(responseText);
+
+            if (classification) {
+              // Emit classification event (always, regardless of result)
+              this.multiplexer.emitEvent(
+                'refusal-classification',
+                selection.modelId,
+                classification.isRefusal,
+                classification.confidence,
+                classification.latencyMs
+              );
+
+              if (classification.isRefusal) {
+                // Emit refusal-detected event
+                this.multiplexer.emitEvent(
+                  'refusal-detected',
+                  selection.modelId,
+                  classification.confidence,
+                  responseText
+                );
+
+                // Report refusal outcome
+                const refusalOutcome: ModelOutcome = {
+                  modelId: selection.modelId,
+                  type: OutcomeType.REFUSAL,
+                  latency: result.outcome.latency,
+                  timestamp: new Date()
+                };
+                await this.multiplexer.reportOutcome(refusalOutcome);
+
+                // Skip this model and retry with a different one (same as throttle path)
+                this.skippedModels.add(selection.modelId);
+                retryCount++;
+                continue;
+              }
+            }
+          }
+          // --- END REFUSAL DETECTION ---
 
           // Report successful outcome to multiplexer
           await this.multiplexer.reportOutcome(result.outcome);
@@ -201,4 +245,16 @@ export interface RequestHandlerDelegate {
    * @param args Event arguments
    */
   emitEvent(event: string, ...args: any[]): void;
+
+  /**
+   * Classify a model response for refusal. Returns null if refusal detection is disabled.
+   * @param responseText Extracted text from the model response
+   * @returns Classification result or null
+   */
+  classifyRefusal(responseText: string): Promise<{ isRefusal: boolean; confidence: number; latencyMs: number } | null>;
+
+  /**
+   * Whether refusal detection is configured and retry-on-refusal is enabled.
+   */
+  refusalRetryEnabled: boolean;
 }

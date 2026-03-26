@@ -9,7 +9,7 @@ import {
   CircuitBreakerStatus,
   ErrorType,
   EnhancedErrorResponse
-} from '../types/index.js';
+} from '../types/index';
 
 /**
  * Default circuit breaker configuration

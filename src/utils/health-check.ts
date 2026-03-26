@@ -8,8 +8,8 @@ import {
   SystemHealthStatus,
   CircuitBreakerState,
   ModelStats
-} from '../types/index.js';
-import { CircuitBreakerManager } from './circuit-breaker.js';
+} from '../types/index';
+import { CircuitBreakerManager } from './circuit-breaker';
 
 /**
  * Request metrics tracker for a model

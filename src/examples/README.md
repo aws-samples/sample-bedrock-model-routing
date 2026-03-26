@@ -30,4 +30,5 @@ npx tsx src/examples/01-basic-usage.ts
 | 07 | [event-system](07-event-system.ts) | Every event the multiplexer emits, including model management and stats |
 | 08 | [statistics](08-statistics.ts) | `getStats()` for cumulative counts, latency percentiles, per-model breakdowns |
 | 09 | [xray-tracing](09-xray-tracing.ts) | Optional X-Ray tracing: config, trace structure, annotations, metadata |
-| 10 | [parallel-stig-processing](10-parallel-stig-processing.ts) | High-throughput batch: parse XCCDF STIG XML, `Promise.all` every vuln rule through the multiplexer, live event logging |
+| 10 | [refusal-detection](10-refusal-detection.ts) | Opt-in ONNX refusal classifier: config, events (`refusal-detected`, `refusal-classification`), per-model refusal stats, retry-on-refusal |
+| 11 | [credential-providers](11-credential-providers.ts) | Using `@aws-sdk/credential-providers` via `clientConfig`: named profiles, assume role, SSO, custom chains, web identity, IMDS |

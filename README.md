@@ -1,6 +1,6 @@
 # Amazon Bedrock Model Multiplexer
 
-A TypeScript client-side facade over the Amazon Bedrock SDK that distributes `ConverseCommand` requests across multiple models using weighted selection, automatic failover, per-model fault isolation, and observability instrumentation.
+A TypeScript client-side facade over the Amazon Bedrock SDK that distributes `ConverseCommand` requests across multiple models using weighted selection, automatic failover, per-model fault isolation, observability instrumentation, and opt-in refusal detection.
 
 ---
 
@@ -52,6 +52,12 @@ interface MultiplexerConfig {
     captureBodies?: boolean;
     captureModelSelection?: boolean;
   };
+  refusalDetection?: {                // Opt-in: classify responses as refusals
+    enabled: boolean;                 //   and retry with a different model
+    modelPath: string;                // Path to the .onnx classifier model
+    confidenceThreshold?: number;     // 0–1, default 0.5
+    retryOnRefusal?: boolean;         // default true
+  };
 }
 ```
 ---
@@ -66,6 +72,104 @@ interface MultiplexerConfig {
 | **Repeated failures** (5 within 60 s) | The model is temporarily removed from rotation for 30 s, then gradually re-introduced. |
 | **Fail-fast errors** (`ValidationException`, etc.) | Request fails immediately; no failover. |
 | **All models unavailable** | `processRequest()` throws `{ code: 'NO_MODELS_AVAILABLE' }`. Models recover automatically once the cool-down period expires. |
+| **Refusal detected** *(opt-in)* | The model's response is classified as a refusal; the model is skipped and a different model is tried — identical to the throttling path. |
+
+---
+
+## Refusal Detection (Opt-In)
+
+Some models may return polite refusals ("I can't help with that") instead of a useful answer. When refusal detection is enabled, the multiplexer classifies every successful response with an in-process ONNX binary classifier **before** returning it to the caller. If the response is classified as a refusal, the model is skipped and the request is automatically retried with a different model — the same failover path used for throttling.
+
+The classifier uses [binary logistic regression](https://aws.amazon.com/what-is/logistic-regression/) to distinguish refusals from compliant responses. It runs in-process on the CPU via `onnxruntime-node` and typically completes in under 5 ms. The model file is **not** included in this repository — you must supply your own `.onnx` classifier and specify its path in the configuration.
+
+### Enabling Refusal Detection
+
+```typescript
+import path from 'path';
+import { createMultiplexer } from 'bedrock-model-multiplexer';
+
+const multiplexer = createMultiplexer(models, {
+  maxRetries: 3,
+  refusalDetection: {
+    enabled: true,
+    modelPath: path.resolve(__dirname, '../models/refusal_classifier.onnx'),
+    confidenceThreshold: 0.5,   // optional — default 0.5
+    retryOnRefusal: true         // optional — default true
+  }
+});
+```
+
+### Configuration Reference
+
+```typescript
+interface RefusalDetectionConfig {
+  /** Enable refusal detection on model responses */
+  enabled: boolean;
+  /** Absolute path to the .onnx model file */
+  modelPath: string;
+  /** Confidence threshold (0–1) above which a response is classified as a refusal.
+   *  Raise for fewer false positives, lower for higher recall. Default: 0.5 */
+  confidenceThreshold?: number;
+  /** Whether to retry with a different model when a refusal is detected.
+   *  Set to false to observe refusals via events without altering the response flow.
+   *  Default: true */
+  retryOnRefusal?: boolean;
+}
+```
+
+### How It Works
+
+```
+Request ──▶ Select model ──▶ Invoke model ──▶ Classify response ──▶ Refusal?
+                                                                      │
+                                                         No ──▶ Return response
+                                                         Yes ──▶ Skip model, retry
+```
+
+1. The ONNX session is loaded asynchronously at multiplexer construction time. If loading fails, the multiplexer continues without refusal detection (graceful degradation).
+2. After each successful model invocation, the response text is extracted from `ConverseCommandOutput.output.message.content` and passed to the classifier.
+3. The classifier returns a confidence score (0–1) for the "rejected" class. If the score meets or exceeds `confidenceThreshold`, the response is classified as a refusal.
+4. When `retryOnRefusal` is `true`, a refusal triggers the same retry logic as a throttle: the current model is skipped and the multiplexer selects a different model. If all models refuse (or are exhausted), the request fails with `NO_MODELS_AVAILABLE`.
+5. When `retryOnRefusal` is `false`, the response is returned as-is but refusal events are still emitted.
+
+### Events
+
+| Event | Signature | When |
+|---|---|---|
+| `refusal-detected` | `(modelId: string, confidence: number, responseText: string)` | A response is classified as a refusal (above threshold) |
+| `refusal-classification` | `(modelId: string, isRefusal: boolean, confidence: number, latencyMs: number)` | Every classification completes (refusal or not) |
+
+```typescript
+multiplexer.on('refusal-detected', (modelId, confidence, text) => {
+  console.log(`Refusal from ${modelId} (${(confidence * 100).toFixed(1)}%): ${text.slice(0, 80)}`);
+});
+
+multiplexer.on('refusal-classification', (modelId, isRefusal, confidence, latencyMs) => {
+  console.log(`Classification: ${modelId} → ${isRefusal ? 'REFUSAL' : 'COMPLIED'} (${latencyMs}ms)`);
+});
+```
+
+### Statistics
+
+Refusal counts are tracked in both aggregate and per-model statistics:
+
+```typescript
+const stats = multiplexer.getStats();
+stats.refusalCount;                         // total refusals across all models
+stats.modelStats['amazon.nova-pro-v1:0'].refusalCount;  // refusals for a specific model
+```
+
+### Cleanup
+
+Call `destroy()` to release the ONNX inference session along with all other multiplexer resources:
+
+```typescript
+multiplexer.destroy();
+```
+
+### Security Note
+
+The ONNX model file (`refusal_classifier.onnx`) is loaded from the filesystem and runs inference entirely within the application process. No data leaves the process. Treat the model file like application code — verify that it comes from a trusted source and is not writable by untrusted users.
 
 ---
 
@@ -82,7 +186,7 @@ const health = multiplexer.getHealthStatus();
 
 // Cumulative statistics
 const stats = multiplexer.getStats();
-// stats.successCount, .rateLimitCount, .latencyMetrics.p95
+// stats.successCount, .rateLimitCount, .refusalCount, .latencyMetrics.p95
 ```
 
 ---

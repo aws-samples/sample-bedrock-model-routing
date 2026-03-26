@@ -19,28 +19,29 @@ export type {
   SystemHealthStatus,
   ValidationError,
   ValidationResult,
-  EnhancedErrorResponse
-} from './types/index.js';
+  EnhancedErrorResponse,
+  RefusalDetectionConfig
+} from './types/index';
 
 // Export enums
 export { 
   OutcomeType,
   CircuitBreakerState,
   ErrorType
-} from './types/index.js';
+} from './types/index';
 
 // Core classes
-export { BedrockMultiplexer } from './core/multiplexer.js';
-export { BedrockModel } from './models/bedrock-model.js';
-export { RequestHandler } from './core/request-handler.js';
-export { MultiplexerError } from './core/errors.js';
+export { BedrockMultiplexer } from './core/multiplexer';
+export { BedrockModel } from './models/bedrock-model';
+export { RequestHandler } from './core/request-handler';
+export { MultiplexerError } from './core/errors';
 
 // Utilities
-export { Timer } from './utils/timer.js';
+export { Timer } from './utils/timer';
 export { 
   weightedRandomSelect, 
   createWeightedItem 
-} from './utils/weighted-selection.js';
+} from './utils/weighted-selection';
 export { 
   classifyError, 
   classifyErrorType,
@@ -51,20 +52,20 @@ export {
   createEnhancedError,
   getRecoverySuggestions,
   getErrorMessage 
-} from './utils/error-classifier.js';
+} from './utils/error-classifier';
 export { 
   MultiplexerTracer, 
   createTracer,
   type TracerInterface,
   type TracingConfig
-} from './utils/tracing.js';
+} from './utils/tracing';
 
 // Circuit breaker
 export {
   CircuitBreaker,
   CircuitBreakerManager,
   DEFAULT_CIRCUIT_BREAKER_CONFIG
-} from './utils/circuit-breaker.js';
+} from './utils/circuit-breaker';
 
 // Validation utilities
 export {
@@ -73,20 +74,29 @@ export {
   CircuitBreakerConfigValidator,
   formatValidationErrors,
   assertValid
-} from './utils/validation.js';
+} from './utils/validation';
 
 // Health check utilities
 export {
   HealthCheckManager,
   HealthCheckEndpoint
-} from './utils/health-check.js';
+} from './utils/health-check';
+
+// Refusal classifier
+export {
+  RefusalClassifier,
+  type RefusalClassifierConfig,
+  type ClassificationResult
+} from './classifiers/refusal-classifier';
+
+export { extractResponseText } from './classifiers/response-extractor';
 
 // Import types for function signatures
 import type { 
   ModelConfiguration, 
   MultiplexerConfig 
-} from './types/index.js';
-import { BedrockMultiplexer } from './core/multiplexer.js';
+} from './types/index';
+import { BedrockMultiplexer } from './core/multiplexer';
 
 /**
  * Create an Amazon Bedrock Model Multiplexer with default configuration

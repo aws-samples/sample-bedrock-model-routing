@@ -83,6 +83,7 @@ describe('HealthCheckManager', () => {
         successCount: 10,
         rateLimitCount: 0,
         failFastCount: 0,
+        refusalCount: 0,
         averageLatency: 150,
         isFallback: false
       };
@@ -160,6 +161,7 @@ describe('HealthCheckManager', () => {
           successCount: 2,
           rateLimitCount: 0,
           failFastCount: 1,
+          refusalCount: 0,
           averageLatency: 133,
           isFallback: false
         }
@@ -432,6 +434,7 @@ describe('HealthCheckEndpoint', () => {
         successCount: 1,
         rateLimitCount: 0,
         failFastCount: 0,
+        refusalCount: 0,
         averageLatency: 100,
         isFallback: false
       };

@@ -17,9 +17,9 @@ import {
   OutcomeType,
   ErrorType,
   EnhancedErrorResponse
-} from '../types/index.js';
-import { classifyError, toErrorResponse, createEnhancedError } from '../utils/error-classifier.js';
-import { CircuitBreaker, DEFAULT_CIRCUIT_BREAKER_CONFIG } from '../utils/circuit-breaker.js';
+} from '../types/index';
+import { classifyError, toErrorResponse, createEnhancedError } from '../utils/error-classifier';
+import { CircuitBreaker, DEFAULT_CIRCUIT_BREAKER_CONFIG } from '../utils/circuit-breaker';
 
 /** The multiplexer owns modelId — callers provide everything else */
 export type MultiplexerInput = Omit<ConverseCommandInput, 'modelId'>;

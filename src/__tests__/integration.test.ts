@@ -22,7 +22,6 @@
 
 import {
   createMultiplexer,
-  DefaultModelConfigs,
   BedrockModel,
   BedrockMultiplexer,
   CircuitBreakerState

@@ -23,7 +23,7 @@
 \definecolor{healthteal}{HTML}{00695C}
 \definecolor{tracebrown}{HTML}{795548}
 
-\title{Amazon Bedrock Model Multiplexer --- Specification \\ \large Weighted Routing of Converse API Requests to Model Pools}
+\title{Amazon Bedrock Model Multiplexer --- Specification \\ \large Weighted Routing of Converse API Requests to Model Pools \\ \large with Post-Inference Refusal Detection}
 \author{Implementation-Agnostic Behavioral Specification}
 \date{}
 
@@ -33,12 +33,13 @@
 
 \section*{Overview}
 
-The \textbf{Amazon Bedrock Model Multiplexer} routes Amazon Bedrock Converse API requests across a pool of models using weighted random selection, per-model circuit breakers, cross-model retry with failover, and real-time health monitoring. The system comprises five logical subsystems:
+The \textbf{Amazon Bedrock Model Multiplexer} routes Amazon Bedrock Converse API requests across a pool of models using weighted random selection, per-model circuit breakers, cross-model retry with failover, post-inference refusal detection, and real-time health monitoring. The system comprises six logical subsystems:
 
 \begin{enumerate}[nosep]
   \item \textbf{Multiplexer} --- orchestrator: owns model pools, delegates to the Request Handler, publishes events
-  \item \textbf{Request Handler} --- per-request state machine: retry loop with cross-model failover
+  \item \textbf{Request Handler} --- per-request state machine: retry loop with cross-model failover and refusal-based re-routing
   \item \textbf{Model Wrapper} --- model adapter: stamps \fld{modelId}, enforces timeout, records circuit breaker outcomes
+  \item \textbf{Refusal Classifier} --- opt-in ONNX binary classifier: detects refusals in model responses, triggers cross-model retry
   \item \textbf{Circuit Breaker / Circuit Breaker Manager} --- per-model three-state breaker (Closed $\to$ Open $\to$ Half-Open)
   \item \textbf{Utilities} --- weighted selection, error classification, health checks, validation, tracing, timers
 \end{enumerate}
@@ -66,7 +67,7 @@ The multiplexer operates on the Amazon Bedrock Converse API request and response
 \cls{MultiplexerInput} & Record & Converse API request with all fields except \fld{modelId} (stamped by multiplexer) \\
 \cls{MultiplexerConfig} & Record & Top-level configuration: model list, timeout, max retries, tracing, circuit breaker settings \\
 \cls{ModelConfiguration} & Record & Per-model config: \fld{modelId} (string), \fld{weight} (number), \fld{isFallback} (boolean) \\
-\cls{MultiplexerStats} & Record & Aggregate stats: success/rateLimit/failFast counts + latency metrics \\
+\cls{MultiplexerStats} & Record & Aggregate stats: success/rateLimit/failFast/refusal counts + latency metrics \\
 \cls{ModelStats} & Record & Per-model stats: counts + averageLatency \\
 \cls{LatencyMetrics} & Record & Percentiles: average, p50, p95, p99, min, max \\
 \cls{ModelOutcome} & Record & Result of one invocation: modelId, outcomeType, latency, timestamp \\
@@ -79,6 +80,8 @@ The multiplexer operates on the Amazon Bedrock Converse API request and response
 \cls{ValidationResult} & Record & isValid flag + list of validation errors \\
 \cls{CircuitBreakerConfig} & Record & failureThreshold, recoveryTimeMs, successThreshold, failureWindowMs \\
 \cls{CircuitBreakerStatus} & Record & state, failureCount, successCount, lastOpenedAt, nextRetryAt \\
+\cls{RefusalDetectionConfig} & Record & Opt-in config: \fld{enabled}, \fld{modelPath}, \fld{confidenceThreshold}, \fld{retryOnRefusal} \\
+\cls{ClassificationResult} & Record & \fld{isRefusal} (boolean), \fld{confidence} (float 0--1), \fld{latencyMs} \\
 \bottomrule
 \end{tabular}
 
@@ -88,7 +91,7 @@ The multiplexer operates on the Amazon Bedrock Converse API request and response
 \toprule
 \textbf{Enum} & \textbf{Values} & \textbf{Semantics} \\
 \midrule
-\cls{OutcomeType} & \texttt{SUCCESS}, \texttt{RATE\_LIMIT}, \texttt{FAIL\_FAST} & Tri-state classification of every invocation attempt \\
+\cls{OutcomeType} & \texttt{SUCCESS}, \texttt{RATE\_LIMIT}, \texttt{FAIL\_FAST}, \texttt{REFUSAL} & Quad-state classification of every invocation attempt \\
 \cls{CircuitBreakerState} & \texttt{CLOSED}, \texttt{OPEN}, \texttt{HALF\_OPEN} & Three-state circuit breaker FSM \\
 \cls{ErrorType} & \op{Validation}, \op{Throttling}, \op{ModelUnavailable}, \op{Timeout}, \op{Cancelled}, \op{CircuitOpen}, \op{Internal}, \op{Authentication}, \op{Network}, \op{Unknown} & 10-variant error taxonomy for diagnostics \\
 \bottomrule
@@ -97,7 +100,7 @@ The multiplexer operates on the Amazon Bedrock Converse API request and response
 %% ============================================================
 \section*{{\color{coreblue}Multiplexer (Orchestrator)}}
 
-The Multiplexer is the top-level entry point. It owns two model pools (primary and fallback), a Circuit Breaker Manager, a Health Check Manager, and an optional Tracer. It publishes typed events via an observer/event-emitter pattern (see Event System section).
+The Multiplexer is the top-level entry point. It owns two model pools (primary and fallback), a Circuit Breaker Manager, a Health Check Manager, an optional Tracer, and an optional Refusal Classifier. It publishes typed events via an observer/event-emitter pattern (see Event System section).
 
 \smallskip
 \begin{tabular}{@{}l l p{6.5cm}@{}}
@@ -115,12 +118,13 @@ The Multiplexer is the top-level entry point. It owns two model pools (primary a
 \fn{resetStats} & $\to$ void & Zero all counters, clear latency history \\
 \fn{getHealthStatus} & $\to$ SystemHealthStatus & Delegate to Health Check Manager \\
 \fn{isHealthy} & $\to$ boolean & True if healthyCount $> 0$ and unhealthyCount $< \max(1, \lfloor n/2 \rfloor)$ \\
-\fn{destroy} & $\to$ void & Destroy all models, clear breakers, remove listeners \\
+\fn{classifyRefusal} & responseText $\to$ ClassificationResult or null & Delegate to Refusal Classifier; null if disabled or not loaded \\
+\fn{destroy} & $\to$ void & Destroy all models, classifier, clear breakers, remove listeners \\
 \bottomrule
 \end{tabular}
 
 \medskip
-\noindent\textbf{Delegate interface} --- The Request Handler communicates with the Multiplexer through a narrow interface of four operations: \fn{selectModel}, \fn{getModel}, \fn{reportOutcome}, and \fn{emitEvent}. This decouples the retry logic from the orchestrator.
+\noindent\textbf{Delegate interface} --- The Request Handler communicates with the Multiplexer through a narrow interface of six operations: \fn{selectModel}, \fn{getModel}, \fn{reportOutcome}, \fn{emitEvent}, \fn{classifyRefusal}, and the \fld{refusalRetryEnabled} flag. This decouples the retry logic from the orchestrator.
 
 \medskip
 \noindent\textbf{Model selection algorithm} (\fn{selectFromPool}):
@@ -149,7 +153,14 @@ Each call to \fn{processRequest} creates a fresh Request Handler instance. It co
   \begin{enumerate}[nosep,label=\alph*.]
     \item Call \fn{selectModel}(\fld{skippedModels}). If null $\to$ raise error with code \texttt{NO\_MODELS\_AVAILABLE}.
     \item Call \fn{getModel}(modelId). If null $\to$ add to skipped, increment retry, continue.
-    \item Call \fn{model.invoke}(input). On success $\to$ report outcome, return response.
+    \item Call \fn{model.invoke}(input). On success $\to$ proceed to refusal check (step d).
+    \item \textbf{Post-inference refusal check} (if \fld{refusalRetryEnabled}):
+    \begin{enumerate}[nosep,label=\roman*.]
+      \item Extract assistant text from response via \fn{extractResponseText}.
+      \item Call \fn{classifyRefusal}(text). Emit \texttt{refusal-classification} event.
+      \item If classified as refusal $\to$ emit \texttt{refusal-detected} event, report \op{Refusal} outcome, add model to skipped, increment retry, continue.
+      \item If not refusal (or classifier disabled) $\to$ report \op{Success} outcome, return response.
+    \end{enumerate}
     \item On \op{RateLimit} error $\to$ report outcome, add model to skipped, increment retry, continue.
     \item On \op{CircuitOpen} error $\to$ report outcome, add model to skipped, increment retry, continue.
     \item On \op{FailFast} error $\to$ raise immediately (no retry).
@@ -157,6 +168,9 @@ Each call to \fn{processRequest} creates a fresh Request Handler instance. It co
   \end{enumerate}
   \item If loop exhausts $\to$ raise error with code \texttt{RETRIES\_EXHAUSTED}.
 \end{enumerate}
+
+\medskip
+\noindent\textbf{Refusal = recoverable outcome:} a detected refusal is treated identically to a \op{RateLimit} in the retry loop --- the model is skipped and a different model is selected immediately. The response is discarded. This allows the same prompt to be retried against a model that may provide a substantive answer. If all models refuse (or retries are exhausted), the last refusal response is \emph{not} returned --- instead, a \texttt{RETRIES\_EXHAUSTED} error is raised.
 
 %% ============================================================
 \section*{{\color{modelgreen}Model Wrapper} \normalfont\small--- Amazon Bedrock model adapter}
@@ -241,6 +255,76 @@ Each model gets a Circuit Breaker instance managed by a single Circuit Breaker M
 \noindent\textbf{Failure window cleanup:} on every \fn{recordFailure} and \fn{getRecentFailureCount}, failures older than \fld{failureWindowMs} are pruned from the list.
 
 %% ============================================================
+\section*{{\color{modelgreen}Refusal Classifier} \normalfont\small--- post-inference response classification}
+
+The Refusal Classifier is an \textbf{opt-in} subsystem that detects when a model returns a refusal (e.g., ``I'm sorry, but I can't help with that'') instead of a substantive answer. When enabled, every successful Converse API response is classified \emph{before} being returned to the caller. If classified as a refusal, the response is discarded and the request is re-routed to a different model --- the same cross-model failover used for throttling errors.
+
+\medskip
+\noindent\textbf{ONNX model contract:}
+
+The classifier wraps a binary ONNX model that embeds a TF-IDF vectorizer in its computation graph, so it accepts raw text strings directly --- no separate tokenizer is needed.
+
+\smallskip
+\begin{tabular}{@{}l l l l@{}}
+\toprule
+\textbf{Direction} & \textbf{Name} & \textbf{Type} & \textbf{Shape / Semantics} \\
+\midrule
+Input & \fld{input} & tensor(string) & $[N, 1]$ --- raw text to classify \\
+Output & \fld{label} & tensor(string) & Predicted class: ``complied'' or ``rejected'' \\
+Output & \fld{probabilities} & tensor(float) & $[p_{\text{complied}}, p_{\text{rejected}}]$ \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent A response is classified as a refusal iff $p_{\text{rejected}} \ge \fld{confidenceThreshold}$.
+
+\medskip
+\noindent\textbf{Operations:}
+
+\smallskip
+\begin{tabular}{@{}l l p{6.5cm}@{}}
+\toprule
+\textbf{Operation} & \textbf{Inputs / Outputs} & \textbf{Semantics} \\
+\midrule
+\fn{construct} & RefusalClassifierConfig $\to$ instance & Store config; session not yet loaded \\
+\fn{initialize} & $\to$ void & Create ONNX inference session (async); must be called before \fn{classify} \\
+\fn{classify} & responseText $\to$ ClassificationResult & Build string tensor $[1, 1]$, run inference, return \{isRefusal, confidence, latencyMs\} \\
+\fn{destroy} & $\to$ void & Release ONNX session resources \\
+\fn{isReady} & $\to$ boolean & True iff session is loaded \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Response text extraction} (\fn{extractResponseText}): extracts the assistant's text from a Converse API response by concatenating all text blocks from the output message. Returns empty string if no text blocks are present.
+
+\medskip
+\noindent\textbf{Configuration} (\cls{RefusalDetectionConfig}):
+
+\smallskip
+\begin{tabular}{@{}l l r p{5cm}@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Default} & \textbf{Semantics} \\
+\midrule
+\fld{enabled} & boolean & --- & Master switch; when false, no classifier is loaded \\
+\fld{modelPath} & string & --- & Path to the \texttt{.onnx} model file \\
+\fld{confidenceThreshold} & number & 0.5 & $p_{\text{rejected}}$ threshold for refusal classification \\
+\fld{retryOnRefusal} & boolean & true & Whether to retry with a different model on refusal \\
+\bottomrule
+\end{tabular}
+
+\medskip
+\noindent\textbf{Lifecycle:}
+\begin{enumerate}[nosep]
+  \item At construction, if \fld{refusalDetection.enabled} is true, the Multiplexer creates a \cls{RefusalClassifier} and starts async initialization of the ONNX session.
+  \item The \fn{classifyRefusal} delegate method awaits initialization before the first classification call.
+  \item If ONNX session initialization fails, the classifier is silently disabled (graceful degradation). A warning is logged and all future \fn{classifyRefusal} calls return null.
+  \item On \fn{destroy}, the ONNX session is released.
+\end{enumerate}
+
+\medskip
+\noindent\textbf{Scope:} refusal classification applies only to non-streaming (\fn{invoke}) responses. Streaming responses (\fn{invokeStream}) are not classified because the full response text is not available until the stream is consumed by the caller.
+
+%% ============================================================
 \section*{{\color{utilorange}Error Classification} \normalfont\small--- error taxonomy}
 
 All AWS SDK errors are classified into two layers: a coarse \cls{OutcomeType} for the retry loop, and a fine \cls{ErrorType} for diagnostics.
@@ -270,7 +354,7 @@ All AWS SDK errors are classified into two layers: a coarse \cls{OutcomeType} fo
 \end{tabular}
 
 \medskip
-\noindent\textbf{Failover semantics:} the multiplexer does \emph{not} perform timed retries or backoff. On a recoverable error (\op{RateLimit} or \op{CircuitOpen}), the failing model is skipped and a different model is selected immediately with zero delay. This is cross-model failover, not same-model retry.
+\noindent\textbf{Failover semantics:} the multiplexer does \emph{not} perform timed retries or backoff. On a recoverable outcome (\op{RateLimit}, \op{CircuitOpen}, or \op{Refusal}), the failing model is skipped and a different model is selected immediately with zero delay. This is cross-model failover, not same-model retry.
 
 %% ============================================================
 \section*{{\color{healthteal}Health Monitoring}}
@@ -356,6 +440,8 @@ The Multiplexer publishes typed events via an observer pattern. Consumers subscr
 \texttt{model-selected} & (modelId, isFallback, skippedCount) \\
 \texttt{model-invocation-start} & (modelId, requestId) \\
 \texttt{model-invocation-complete} & (modelId, requestId, latencyMs) \\
+\texttt{refusal-detected} & (modelId, confidence, responseText) \\
+\texttt{refusal-classification} & (modelId, isRefusal, confidence, latencyMs) \\
 \bottomrule
 \end{tabular}
 
@@ -409,12 +495,19 @@ End-to-end pseudocode for a single \fn{processRequest} call:
   //       -> race: operation vs timeout vs abort signal
   //       -> on success: breaker.recordSuccess(), return {response, outcome}
   //       -> on error:   breaker.recordFailure(), raise typed error with outcome
-  //    d. delegate.reportOutcome(outcome)
+  //    d. [if refusalRetryEnabled] Post-inference refusal check:
+  //       -> text = extractResponseText(response)
+  //       -> result = delegate.classifyRefusal(text)   // ONNX inference
+  //       -> emit 'refusal-classification' event
+  //       -> if result.isRefusal:
+  //            emit 'refusal-detected', report REFUSAL outcome
+  //            skip model, retry with next model (same as throttle path)
+  //    e. delegate.reportOutcome(outcome)
   //       -> updateModelStats(), recordLatency()
   //       -> healthCheckManager.recordSuccess/Failure()
   //       -> publish 'success' or 'error' event, publish 'stats' event
-  //    e. On RateLimit or CircuitOpen: skip model, retry with next model
-  //    f. On FailFast: raise to caller immediately
+  //    f. On RateLimit, CircuitOpen, or Refusal: skip model, retry with next
+  //    g. On FailFast: raise to caller immediately
   // 4. Response returned to caller (or error raised)
 \end{lstlisting}
 

@@ -52,7 +52,9 @@ describe('RequestHandler', () => {
       selectModel: jest.fn(),
       getModel: jest.fn(),
       reportOutcome: jest.fn(),
-      emitEvent: jest.fn()
+      emitEvent: jest.fn(),
+      classifyRefusal: jest.fn().mockResolvedValue(null),
+      refusalRetryEnabled: false
     };
   });
 
@@ -559,6 +561,179 @@ describe('RequestHandler', () => {
         expect(error).toBeInstanceOf(Error);
         expect(error.stack).toBeDefined();
       }
+    });
+
+    describe('refusal detection', () => {
+      it('should skip classification when refusalRetryEnabled is false', async () => {
+        const response = makeOutput('Hello!');
+        const outcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.SUCCESS,
+          latency: 100,
+          timestamp: new Date()
+        };
+
+        mockDelegate.selectModel.mockResolvedValue({ modelId: 'test-model', isFallback: false });
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+        mockModel.invoke.mockResolvedValue({ response, outcome });
+        mockDelegate.refusalRetryEnabled = false;
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(response);
+        expect(mockDelegate.classifyRefusal).not.toHaveBeenCalled();
+      });
+
+      it('should return response normally when classifier returns non-refusal', async () => {
+        const response = makeOutput('Here is the answer.');
+        const outcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.SUCCESS,
+          latency: 100,
+          timestamp: new Date()
+        };
+
+        mockDelegate.selectModel.mockResolvedValue({ modelId: 'test-model', isFallback: false });
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+        mockModel.invoke.mockResolvedValue({ response, outcome });
+        mockDelegate.refusalRetryEnabled = true;
+        mockDelegate.classifyRefusal.mockResolvedValue({
+          isRefusal: false,
+          confidence: 0.1,
+          latencyMs: 2
+        });
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(response);
+        expect(mockDelegate.classifyRefusal).toHaveBeenCalledWith('Here is the answer.');
+        expect(mockDelegate.reportOutcome).toHaveBeenCalledWith(outcome);
+        // Should emit refusal-classification event
+        expect(mockDelegate.emitEvent).toHaveBeenCalledWith(
+          'refusal-classification', 'test-model', false, 0.1, 2
+        );
+      });
+
+      it('should retry with different model when refusal is detected', async () => {
+        const refusalResponse = makeOutput("I can't help with that.");
+        const refusalOutcome: ModelOutcome = {
+          modelId: 'model-1',
+          type: OutcomeType.SUCCESS,
+          latency: 100,
+          timestamp: new Date()
+        };
+
+        const successResponse = makeOutput('Here is the answer.');
+        const successOutcome: ModelOutcome = {
+          modelId: 'model-2',
+          type: OutcomeType.SUCCESS,
+          latency: 150,
+          timestamp: new Date()
+        };
+
+        const secondModel = { ...mockModel, modelId: 'model-2' };
+
+        mockDelegate.selectModel
+          .mockResolvedValueOnce({ modelId: 'model-1', isFallback: false })
+          .mockResolvedValueOnce({ modelId: 'model-2', isFallback: false });
+
+        mockDelegate.getModel
+          .mockResolvedValueOnce(mockModel)
+          .mockResolvedValueOnce(secondModel as any);
+
+        mockModel.invoke.mockResolvedValue({ response: refusalResponse, outcome: refusalOutcome });
+        (secondModel as any).invoke = jest.fn().mockResolvedValue({
+          response: successResponse,
+          outcome: successOutcome
+        });
+
+        mockDelegate.refusalRetryEnabled = true;
+        mockDelegate.classifyRefusal
+          .mockResolvedValueOnce({ isRefusal: true, confidence: 0.92, latencyMs: 3 })
+          .mockResolvedValueOnce({ isRefusal: false, confidence: 0.05, latencyMs: 2 });
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(successResponse);
+
+        // Should have emitted refusal-detected for model-1
+        expect(mockDelegate.emitEvent).toHaveBeenCalledWith(
+          'refusal-detected', 'model-1', 0.92, "I can't help with that."
+        );
+
+        // Should have reported REFUSAL outcome for model-1
+        expect(mockDelegate.reportOutcome).toHaveBeenCalledWith(
+          expect.objectContaining({
+            modelId: 'model-1',
+            type: OutcomeType.REFUSAL
+          })
+        );
+
+        // model-1 should be skipped on second selection
+        const secondCallArg = mockDelegate.selectModel.mock.calls[1][0];
+        expect(secondCallArg.skippedModels.has('model-1')).toBe(true);
+      });
+
+      it('should handle classifier returning null (disabled)', async () => {
+        const response = makeOutput('Hello!');
+        const outcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.SUCCESS,
+          latency: 100,
+          timestamp: new Date()
+        };
+
+        mockDelegate.selectModel.mockResolvedValue({ modelId: 'test-model', isFallback: false });
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+        mockModel.invoke.mockResolvedValue({ response, outcome });
+        mockDelegate.refusalRetryEnabled = true;
+        mockDelegate.classifyRefusal.mockResolvedValue(null);
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(response);
+        // Should NOT emit refusal-classification when classifier returns null
+        expect(mockDelegate.emitEvent).not.toHaveBeenCalledWith(
+          'refusal-classification', expect.anything(), expect.anything(), expect.anything(), expect.anything()
+        );
+      });
+
+      it('should exhaust retries when all models refuse', async () => {
+        const refusalResponse = makeOutput("I can't do that.");
+        const outcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.SUCCESS,
+          latency: 100,
+          timestamp: new Date()
+        };
+
+        mockDelegate.selectModel
+          .mockResolvedValueOnce({ modelId: 'test-model', isFallback: false })
+          .mockResolvedValue({ modelId: null, isFallback: false });
+
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+        mockModel.invoke.mockResolvedValue({ response: refusalResponse, outcome });
+        mockDelegate.refusalRetryEnabled = true;
+        mockDelegate.classifyRefusal.mockResolvedValue({
+          isRefusal: true,
+          confidence: 0.95,
+          latencyMs: 2
+        });
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 1);
+
+        try {
+          await handler.process();
+          fail('Should have thrown');
+        } catch (error: any) {
+          expect(error).toBeInstanceOf(MultiplexerError);
+          expect(error.code).toBe('NO_MODELS_AVAILABLE');
+        }
+      });
     });
   });
 });

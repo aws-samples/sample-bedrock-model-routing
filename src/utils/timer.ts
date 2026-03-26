@@ -1,4 +1,4 @@
-import { MultiplexerTimer } from '../types/index.js';
+import { MultiplexerTimer } from '../types/index';
 
 /**
  * Timer implementation for managing model re-enabling timeouts

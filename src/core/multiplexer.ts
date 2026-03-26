@@ -14,20 +14,21 @@ import {
   SystemHealthStatus,
   ModelHealthStatus,
   CircuitBreakerState
-} from '../types/index.js';
-import { BedrockModel, MultiplexerInput } from '../models/bedrock-model.js';
+} from '../types/index';
+import { BedrockModel, MultiplexerInput } from '../models/bedrock-model';
 import { ConverseCommandOutput } from '@aws-sdk/client-bedrock-runtime';
-import { RequestHandler, RequestHandlerDelegate } from './request-handler.js';
+import { RequestHandler, RequestHandlerDelegate } from './request-handler';
 import { 
   weightedRandomSelect, 
   createWeightedItem,
   WeightedItem 
-} from '../utils/weighted-selection.js';
+} from '../utils/weighted-selection';
 
-import { MultiplexerTracer, createTracer } from '../utils/tracing.js';
-import { CircuitBreakerManager, DEFAULT_CIRCUIT_BREAKER_CONFIG } from '../utils/circuit-breaker.js';
-import { HealthCheckManager, HealthCheckEndpoint } from '../utils/health-check.js';
-import { MultiplexerConfigValidator, assertValid } from '../utils/validation.js';
+import { MultiplexerTracer, createTracer } from '../utils/tracing';
+import { CircuitBreakerManager, DEFAULT_CIRCUIT_BREAKER_CONFIG } from '../utils/circuit-breaker';
+import { HealthCheckManager, HealthCheckEndpoint } from '../utils/health-check';
+import { MultiplexerConfigValidator, assertValid } from '../utils/validation';
+import { RefusalClassifier } from '../classifiers/refusal-classifier';
 
 /**
  * Model information maintained by the multiplexer
@@ -55,6 +56,8 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
   private readonly circuitBreakerManager: CircuitBreakerManager;
   private readonly healthCheckManager: HealthCheckManager;
   private readonly healthCheckEndpoint: HealthCheckEndpoint;
+  private refusalClassifier: RefusalClassifier | null = null;
+  private classifierReady: Promise<void> | null = null;
 
   /**
    * Create a new BedrockMultiplexer
@@ -93,6 +96,21 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
     this.healthCheckManager = new HealthCheckManager(this.circuitBreakerManager);
     this.healthCheckEndpoint = new HealthCheckEndpoint(this.healthCheckManager);
     
+    // Initialize refusal classifier if configured (opt-in)
+    if (config.refusalDetection?.enabled) {
+      this.refusalClassifier = new RefusalClassifier({
+        modelPath: config.refusalDetection.modelPath,
+        confidenceThreshold: config.refusalDetection.confidenceThreshold
+      });
+      // Start async initialization — classifyRefusal() awaits this before classifying
+      this.classifierReady = this.refusalClassifier.initialize().catch((err) => {
+        // Graceful degradation: log warning and continue without classification
+        console.warn(`[BedrockMultiplexer] Failed to initialize refusal classifier: ${err.message}. Refusal detection will be disabled.`);
+        this.refusalClassifier = null;
+        this.classifierReady = null;
+      });
+    }
+
     this.initializeModels();
   }
 
@@ -114,6 +132,7 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
         successCount: 0,
         rateLimitCount: 0,
         failFastCount: 0,
+        refusalCount: 0,
         averageLatency: 0,
         isFallback: modelConfig.isFallback
       }
@@ -232,6 +251,7 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
     const totalSuccess = allModels.reduce((sum, info) => sum + info.stats.successCount, 0);
     const totalRateLimit = allModels.reduce((sum, info) => sum + info.stats.rateLimitCount, 0);
     const totalFailFast = allModels.reduce((sum, info) => sum + info.stats.failFastCount, 0);
+    const totalRefusal = allModels.reduce((sum, info) => sum + info.stats.refusalCount, 0);
 
     const modelStats: Record<string, ModelStats> = {};
     allModels.forEach(info => {
@@ -242,6 +262,7 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
       successCount: totalSuccess,
       rateLimitCount: totalRateLimit,
       failFastCount: totalFailFast,
+      refusalCount: totalRefusal,
       modelStats,
       latencyMetrics: this.calculateLatencyMetrics()
     };
@@ -260,6 +281,7 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
       info.stats.successCount = 0;
       info.stats.rateLimitCount = 0;
       info.stats.failFastCount = 0;
+      info.stats.refusalCount = 0;
       info.stats.averageLatency = 0;
     });
 
@@ -442,10 +464,13 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
       case OutcomeType.FAIL_FAST:
         stats.failFastCount++;
         break;
+      case OutcomeType.REFUSAL:
+        stats.refusalCount++;
+        break;
     }
 
     // Update average latency
-    const totalRequests = stats.successCount + stats.rateLimitCount + stats.failFastCount;
+    const totalRequests = stats.successCount + stats.rateLimitCount + stats.failFastCount + stats.refusalCount;
     if (totalRequests > 0) {
       stats.averageLatency = (stats.averageLatency * (totalRequests - 1) + outcome.latency) / totalRequests;
     }
@@ -599,6 +624,37 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
   }
 
   /**
+   * Classify a model response for refusal (implements RequestHandlerDelegate).
+   * Returns null if refusal detection is disabled or the classifier failed to load.
+   * @param responseText Extracted text from the model response
+   * @returns Classification result or null
+   */
+  public async classifyRefusal(responseText: string): Promise<{ isRefusal: boolean; confidence: number; latencyMs: number } | null> {
+    if (!this.refusalClassifier || !this.classifierReady) {
+      return null; // Refusal detection not enabled or failed to initialize
+    }
+
+    // Ensure the ONNX session is loaded
+    await this.classifierReady;
+
+    // After awaiting, the classifier may have been nulled out by the catch handler
+    if (!this.refusalClassifier) {
+      return null;
+    }
+
+    return this.refusalClassifier.classify(responseText);
+  }
+
+  /**
+   * Whether refusal detection is configured and the retry-on-refusal behavior is enabled.
+   * Used by RequestHandler to decide whether to run post-inference classification.
+   */
+  public get refusalRetryEnabled(): boolean {
+    return this.config.refusalDetection?.enabled === true &&
+           this.config.refusalDetection?.retryOnRefusal !== false;
+  }
+
+  /**
    * Destroy the multiplexer and clean up resources
    */
   public destroy(): void {
@@ -610,6 +666,13 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
     this.fallbackModels.forEach((info) => {
       info.model.destroy();
     });
+
+    // Clean up refusal classifier
+    if (this.refusalClassifier) {
+      this.refusalClassifier.destroy();
+      this.refusalClassifier = null;
+      this.classifierReady = null;
+    }
 
     this.primaryModels.clear();
     this.fallbackModels.clear();
