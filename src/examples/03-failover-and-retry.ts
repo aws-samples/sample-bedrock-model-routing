@@ -1,16 +1,26 @@
 /**
- * Example 3: Failover and Retry
+ * Example 3: Failover, Retry, and Service Tier Escalation
  *
- * Demonstrates cross-model failover behaviour. When a model returns a
- * ThrottlingException (rate limit), the multiplexer immediately skips it
- * and selects a different model — zero delay, no same-model retry.
+ * Demonstrates cross-model failover behaviour and opt-in service tier
+ * escalation. When a model returns a ThrottlingException (rate limit),
+ * the multiplexer can either skip it immediately or first retry the same
+ * model at a higher service tier before falling back to a different model.
  *
  * Key behaviours:
  * - RATE_LIMIT errors → skip model, try next (cross-model failover)
+ * - RATE_LIMIT + tier escalation → retry same model at Priority/Reserved, then skip if still fails
  * - FAIL_FAST errors (ValidationException, etc.) → fail immediately, no retry
  * - Timeout errors → fail immediately, no cross-model failover
  * - CircuitOpen errors → skip model, try next
  * - No models available → throw 503 MultiplexerError
+ *
+ * Service tier escalation (opt-in):
+ * - All requests start at "default" (Standard) tier
+ * - On throttling, the same model is retried at "priority" or "reserved" tier
+ * - One escalation attempt per model per request (does not consume retry budget)
+ * - "reserved" if you have a capacity reservation, "priority" if not
+ *
+ * See: https://docs.aws.amazon.com/bedrock/latest/userguide/service-tiers-inference.html
  */
 import 'dotenv/config';
 import { ConverseCommandInput } from '@aws-sdk/client-bedrock-runtime';
@@ -101,6 +111,57 @@ async function main(): Promise<void> {
   }
 
   multiplexer.destroy();
+
+  // --- Service tier escalation (opt-in) ---
+  console.log('\n=== Service Tier Escalation ===\n');
+
+  // With tier escalation enabled, the multiplexer retries the same model
+  // at a higher tier before skipping it. The flow becomes:
+  //   Model A (Standard) → throttled → Model A (Priority) → if still fails → Model B (Standard)
+  const escalatingMultiplexer = createMultiplexer(models, {
+    maxRetries: 3,
+    clientConfig: { region: 'us-east-1', maxAttempts: 1 },
+    tierEscalation: {
+      enabled: true,
+      escalationTier: 'priority',  // Use "reserved" if you have a capacity reservation
+    },
+  });
+
+  // Watch the escalation sequence
+  escalatingMultiplexer.on('model-invocation-start', (modelId: string, requestId: string) => {
+    console.log(`  🚀 Trying model: ${modelId} [${requestId}]`);
+  });
+
+  escalatingMultiplexer.on('tier-escalation', (modelId: string, fromTier: string, toTier: string) => {
+    console.log(`  ⬆️  Escalating ${modelId}: ${fromTier} → ${toTier}`);
+  });
+
+  escalatingMultiplexer.on('tier-escalation-success', (modelId: string, tier: string) => {
+    console.log(`  ✅ Escalation succeeded: ${modelId} at ${tier} tier`);
+  });
+
+  escalatingMultiplexer.on('tier-escalation-failure', (modelId: string, tier: string, error: string) => {
+    console.log(`  ❌ Escalation failed: ${modelId} at ${tier} — falling back to next model`);
+  });
+
+  console.log('Sending request with tier escalation enabled:\n');
+  try {
+    const response = await escalatingMultiplexer.processRequest(input);
+    console.log('✅ Request succeeded');
+  } catch (error: any) {
+    if (error instanceof MultiplexerError) {
+      console.log(`❌ Multiplexer error: ${error.message} (code: ${error.code})`);
+    } else {
+      console.log(`❌ SDK error: ${error.name}: ${error.message}`);
+    }
+  }
+
+  // Escalation attempts don't consume the cross-model retry budget.
+  // With maxRetries: 3 and 3 models, the worst-case sequence is:
+  //   A (Standard) → A (Priority) → B (Standard) → B (Priority) → C (Standard) → C (Priority) → RETRIES_EXHAUSTED
+  console.log('\nEscalation budget: one attempt per model per request (free, not counted as a retry)');
+
+  escalatingMultiplexer.destroy();
 }
 
 main().catch(console.error);

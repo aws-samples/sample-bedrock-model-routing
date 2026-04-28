@@ -20,7 +20,9 @@ export type {
   ValidationError,
   ValidationResult,
   EnhancedErrorResponse,
-  RefusalDetectionConfig
+  RefusalDetectionConfig,
+  TierEscalationConfig,
+  ServiceTierType
 } from './types/index';
 
 // Export enums

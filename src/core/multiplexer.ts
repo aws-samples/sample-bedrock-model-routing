@@ -13,7 +13,8 @@ import {
   LatencyMetrics,
   SystemHealthStatus,
   ModelHealthStatus,
-  CircuitBreakerState
+  CircuitBreakerState,
+  TierEscalationConfig
 } from '../types/index';
 import { BedrockModel, MultiplexerInput } from '../models/bedrock-model';
 import { ConverseCommandOutput } from '@aws-sdk/client-bedrock-runtime';
@@ -652,6 +653,14 @@ export class BedrockMultiplexer extends EventEmitter implements RequestHandlerDe
   public get refusalRetryEnabled(): boolean {
     return this.config.refusalDetection?.enabled === true &&
            this.config.refusalDetection?.retryOnRefusal !== false;
+  }
+
+  /**
+   * Service tier escalation configuration (implements RequestHandlerDelegate).
+   * Returns the tier escalation config if enabled, undefined otherwise.
+   */
+  public get tierEscalationConfig(): TierEscalationConfig | undefined {
+    return this.config.tierEscalation?.enabled ? this.config.tierEscalation : undefined;
   }
 
   /**

@@ -2,7 +2,9 @@ import {
   ModelOutcome,
   OutcomeType,
   SelectModelRequest,
-  SelectModelResponse
+  SelectModelResponse,
+  ServiceTierType,
+  TierEscalationConfig
 } from '../types/index';
 import { BedrockModel, MultiplexerInput } from '../models/bedrock-model';
 import { ConverseCommandOutput } from '@aws-sdk/client-bedrock-runtime';
@@ -10,8 +12,8 @@ import { MultiplexerError } from './errors';
 import { extractResponseText } from '../classifiers/response-extractor';
 
 /**
- * RequestHandler manages individual chat requests with retry logic
- * and cross-model failover.
+ * RequestHandler manages individual chat requests with retry logic,
+ * cross-model failover, and service tier escalation.
  */
 export class RequestHandler {
   private readonly input: MultiplexerInput;
@@ -19,6 +21,8 @@ export class RequestHandler {
   private readonly maxRetries: number;
   private readonly requestId: string;
   private readonly skippedModels: Set<string> = new Set();
+  /** Tracks models that have already attempted tier escalation for this request */
+  private readonly tierEscalatedModels: Set<string> = new Set();
 
   constructor(
     input: MultiplexerInput,
@@ -75,7 +79,7 @@ export class RequestHandler {
         const invokeStartTime = Date.now();
 
         try {
-          // Invoke the model
+          // Invoke the model (at default/Standard tier)
           const result = await model.invoke(this.input);
 
           // Emit model-invocation-complete event (success path)
@@ -152,8 +156,14 @@ export class RequestHandler {
           // Report the outcome to the multiplexer
           await this.multiplexer.reportOutcome(outcome);
           
-          // For rate limiting errors, skip this model and try another
+          // For rate limiting errors, attempt tier escalation before skipping the model
           if (outcome.type === OutcomeType.RATE_LIMIT) {
+            const escalationResult = await this.attemptTierEscalation(outcome.modelId);
+            if (escalationResult) {
+              // Tier escalation succeeded — return the response
+              return escalationResult;
+            }
+            // Tier escalation not available or failed — skip model and try another
             this.skippedModels.add(outcome.modelId);
             retryCount++;
             continue;
@@ -186,6 +196,108 @@ export class RequestHandler {
         lastError: lastError?.message
       }
     );
+  }
+
+  /**
+   * Attempt to retry the same model at a higher service tier.
+   * Returns the response if escalation succeeds, or null if escalation
+   * is not available or fails (caller should proceed with cross-model failover).
+   *
+   * Tier escalation gets one attempt per model per request.
+   */
+  private async attemptTierEscalation(modelId: string): Promise<ConverseCommandOutput | null> {
+    const tierConfig = this.multiplexer.tierEscalationConfig;
+
+    // Tier escalation not enabled
+    if (!tierConfig?.enabled) {
+      return null;
+    }
+
+    // Already attempted escalation for this model in this request
+    if (this.tierEscalatedModels.has(modelId)) {
+      return null;
+    }
+
+    // Mark this model as having attempted escalation
+    this.tierEscalatedModels.add(modelId);
+
+    const escalationTier = tierConfig.escalationTier;
+    const fromTier: ServiceTierType = 'default';
+
+    // Emit tier-escalation event
+    this.multiplexer.emitEvent('tier-escalation', modelId, fromTier, escalationTier);
+
+    // Get the model instance
+    const model = await this.multiplexer.getModel(modelId);
+    if (!model) {
+      return null;
+    }
+
+    try {
+      // Retry the same model at the escalation tier
+      const result = await model.invoke(this.input, undefined, escalationTier);
+
+      // Emit tier-escalation-success event
+      this.multiplexer.emitEvent('tier-escalation-success', modelId, escalationTier);
+
+      // Run refusal detection on the escalated response if enabled
+      if (this.multiplexer.refusalRetryEnabled) {
+        const responseText = extractResponseText(result.response);
+        const classification = await this.multiplexer.classifyRefusal(responseText);
+
+        if (classification) {
+          this.multiplexer.emitEvent(
+            'refusal-classification',
+            modelId,
+            classification.isRefusal,
+            classification.confidence,
+            classification.latencyMs
+          );
+
+          if (classification.isRefusal) {
+            this.multiplexer.emitEvent(
+              'refusal-detected',
+              modelId,
+              classification.confidence,
+              responseText
+            );
+
+            const refusalOutcome: ModelOutcome = {
+              modelId,
+              type: OutcomeType.REFUSAL,
+              latency: result.outcome.latency,
+              timestamp: new Date()
+            };
+            await this.multiplexer.reportOutcome(refusalOutcome);
+
+            // Refusal on escalated tier — fall through to cross-model failover
+            return null;
+          }
+        }
+      }
+
+      // Report successful outcome
+      await this.multiplexer.reportOutcome(result.outcome);
+
+      return result.response;
+    } catch (escalationError: any) {
+      // Emit tier-escalation-failure event
+      this.multiplexer.emitEvent(
+        'tier-escalation-failure',
+        modelId,
+        escalationTier,
+        escalationError.message || 'Unknown error'
+      );
+
+      // Report the escalation failure outcome if available
+      const escalationOutcome = this.extractOutcome(escalationError);
+      if (escalationOutcome) {
+        await this.multiplexer.reportOutcome(escalationOutcome);
+      }
+
+      // Escalation failed — return null so caller proceeds with cross-model failover
+      return null;
+    }
   }
 
   /**
@@ -257,4 +369,10 @@ export interface RequestHandlerDelegate {
    * Whether refusal detection is configured and retry-on-refusal is enabled.
    */
   refusalRetryEnabled: boolean;
+
+  /**
+   * Service tier escalation configuration, or undefined if not configured.
+   * Used by RequestHandler to decide whether to retry at a higher tier on throttling.
+   */
+  tierEscalationConfig: TierEscalationConfig | undefined;
 }

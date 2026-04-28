@@ -282,6 +282,91 @@ describe('MultiplexerConfigValidator', () => {
       });
       expect(result.isValid).toBe(true);
     });
+
+    // --- tierEscalation validation ---
+
+    it('should accept config without tierEscalation (optional)', () => {
+      const result = MultiplexerConfigValidator.validate(validConfig);
+      expect(result.isValid).toBe(true);
+    });
+
+    it('should accept valid tierEscalation with priority', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: { enabled: true, escalationTier: 'priority' }
+      });
+      expect(result.isValid).toBe(true);
+    });
+
+    it('should accept valid tierEscalation with reserved', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: { enabled: true, escalationTier: 'reserved' }
+      });
+      expect(result.isValid).toBe(true);
+    });
+
+    it('should accept disabled tierEscalation without escalationTier', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: { enabled: false }
+      });
+      expect(result.isValid).toBe(true);
+    });
+
+    it('should reject non-object tierEscalation', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: 'not-an-object'
+      });
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.field === 'tierEscalation')).toBe(true);
+    });
+
+    it('should reject array tierEscalation', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: [1, 2]
+      });
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.field === 'tierEscalation')).toBe(true);
+    });
+
+    it('should reject non-boolean tierEscalation.enabled', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: { enabled: 'yes' }
+      });
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.field === 'tierEscalation.enabled')).toBe(true);
+    });
+
+    it('should reject missing escalationTier when enabled', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: { enabled: true }
+      });
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.field === 'tierEscalation.escalationTier')).toBe(true);
+    });
+
+    it('should reject invalid escalationTier value', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: { enabled: true, escalationTier: 'flex' }
+      });
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.field === 'tierEscalation.escalationTier')).toBe(true);
+    });
+
+    it('should reject non-string escalationTier', () => {
+      const result = MultiplexerConfigValidator.validate({
+        ...validConfig,
+        tierEscalation: { enabled: true, escalationTier: 123 }
+      });
+      expect(result.isValid).toBe(false);
+      expect(result.errors.some(e => e.field === 'tierEscalation.escalationTier')).toBe(true);
+    });
   });
 });
 

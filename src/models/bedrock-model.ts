@@ -16,7 +16,8 @@ import {
   ModelOutcome,
   OutcomeType,
   ErrorType,
-  EnhancedErrorResponse
+  EnhancedErrorResponse,
+  ServiceTierType
 } from '../types/index';
 import { classifyError, toErrorResponse, createEnhancedError } from '../utils/error-classifier';
 import { CircuitBreaker, DEFAULT_CIRCUIT_BREAKER_CONFIG } from '../utils/circuit-breaker';
@@ -102,8 +103,11 @@ export class BedrockModel {
   /**
    * Invoke the model with a Converse API input
    * The multiplexer stamps modelId — the caller provides everything else
+   * @param input The Converse API input (without modelId)
+   * @param abortSignal Optional abort signal for cancellation
+   * @param serviceTier Optional service tier to stamp on the request
    */
-  public async invoke(input: MultiplexerInput, abortSignal?: AbortSignal): Promise<{
+  public async invoke(input: MultiplexerInput, abortSignal?: AbortSignal, serviceTier?: ServiceTierType): Promise<{
     response: ConverseCommandOutput;
     outcome: ModelOutcome;
   }> {
@@ -129,8 +133,12 @@ export class BedrockModel {
     const timeoutMs = this.defaultTimeoutMs;
 
     try {
-      // Stamp modelId onto the caller's input — the only mutation the multiplexer makes
-      const command = new ConverseCommand({ ...input, modelId: this.config.modelId });
+      // Stamp modelId (and optionally serviceTier) onto the caller's input
+      const commandInput: ConverseCommandInput = { ...input, modelId: this.config.modelId };
+      if (serviceTier) {
+        commandInput.serviceTier = { type: serviceTier };
+      }
+      const command = new ConverseCommand(commandInput);
       
       const response = await this.executeWithTimeout(
         () => this.client.send(command, { abortSignal }),
