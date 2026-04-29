@@ -58,6 +58,11 @@ interface MultiplexerConfig {
     confidenceThreshold?: number;     // 0–1, default 0.5
     retryOnRefusal?: boolean;         // default true
   };
+  tierEscalation?: {                  // Opt-in: retry at a higher service tier
+    enabled: boolean;                 //   on throttling before cross-model failover
+    escalationTier: 'reserved'        // "reserved" if you have a capacity reservation,
+                  | 'priority';       // "priority" if not
+  };
 }
 ```
 ---
@@ -69,6 +74,7 @@ interface MultiplexerConfig {
 | Scenario | What happens |
 |---|---|
 | **Throttling** (`ThrottlingException`) | The failing model is skipped and a different model is selected immediately — no delay, no same-model retry. |
+| **Throttling + Tier Escalation** *(opt-in)* | On throttling, the same model is retried at a higher service tier (Priority or Reserved) before falling back to a different model. |
 | **Repeated failures** (5 within 60 s) | The model is temporarily removed from rotation for 30 s, then gradually re-introduced. |
 | **Fail-fast errors** (`ValidationException`, etc.) | Request fails immediately; no failover. |
 | **All models unavailable** | `processRequest()` throws `{ code: 'NO_MODELS_AVAILABLE' }`. Models recover automatically once the cool-down period expires. |
@@ -170,6 +176,83 @@ multiplexer.destroy();
 ### Security Note
 
 The ONNX model file (`refusal_classifier.onnx`) is loaded from the filesystem and runs inference entirely within the application process. No data leaves the process. Treat the model file like application code — verify that it comes from a trusted source and is not writable by untrusted users.
+
+---
+
+## Service Tier Escalation (Opt-In)
+
+Amazon Bedrock offers [service tiers](https://docs.aws.amazon.com/bedrock/latest/userguide/service-tiers-inference.html) (Reserved, Priority, Standard, Flex) that control request prioritization and capacity allocation. When tier escalation is enabled, the multiplexer retries the **same model at a higher-priority tier** before falling back to a different model on throttling errors. This adds a new resilience dimension — exploiting tier-level capacity before exhausting cross-model failover.
+
+### How It Works
+
+```
+Model A (Standard) → ThrottlingException → retry Model A (Priority or Reserved) → success
+                                                                                  → still fails → skip A → try Model B (Standard) → ...
+```
+
+A throttling error at Standard doesn't mean the model is broken — it means that tier is congested. The same model at a higher tier may succeed immediately since Reserved/Priority requests are served ahead of Standard.
+
+### Enabling Tier Escalation
+
+```typescript
+import { createMultiplexer } from 'bedrock-model-multiplexer';
+
+// If you have a capacity reservation:
+const multiplexer = createMultiplexer(models, {
+  maxRetries: 3,
+  tierEscalation: {
+    enabled: true,
+    escalationTier: 'reserved'  // Use reserved capacity on throttling
+  }
+});
+
+// If you don't have a reservation:
+const multiplexer2 = createMultiplexer(models, {
+  maxRetries: 3,
+  tierEscalation: {
+    enabled: true,
+    escalationTier: 'priority'  // Use priority tier on throttling (price premium)
+  }
+});
+```
+
+### Configuration Reference
+
+```typescript
+interface TierEscalationConfig {
+  /** Enable service tier escalation on throttling errors */
+  enabled: boolean;
+  /** The tier to escalate to: "reserved" (if you have a reservation) or "priority" (if not) */
+  escalationTier: 'reserved' | 'priority';
+}
+```
+
+### Escalation Budget
+
+Tier escalation gets **one attempt per model per request**. It does not consume the cross-model retry budget. If model A is throttled at Standard, it gets one retry at the escalation tier. If that also fails, model A is skipped and the multiplexer proceeds to model B (which gets its own escalation attempt).
+
+### Events
+
+| Event | Signature | When |
+|---|---|---|
+| `tier-escalation` | `(modelId: string, fromTier: string, toTier: string)` | A request is being retried at a higher tier |
+| `tier-escalation-success` | `(modelId: string, tier: string)` | The escalated request succeeded |
+| `tier-escalation-failure` | `(modelId: string, tier: string, error: string)` | The escalated request also failed |
+
+```typescript
+multiplexer.on('tier-escalation', (modelId, from, to) => {
+  console.log(`Escalating ${modelId}: ${from} → ${to}`);
+});
+
+multiplexer.on('tier-escalation-success', (modelId, tier) => {
+  console.log(`Escalation succeeded for ${modelId} at ${tier} tier`);
+});
+```
+
+### When Not to Use
+
+- If your workload is cost-sensitive and you want to avoid Priority tier pricing, leave tier escalation disabled. The default cross-model failover still provides resilience.
+- Tier escalation only triggers on throttling errors (HTTP 429). Other error types (timeout, auth, validation) skip directly to cross-model failover.
 
 ---
 

@@ -170,6 +170,32 @@ export interface MultiplexerConfig {
   };
   /** Refusal detection configuration (opt-in) */
   refusalDetection?: RefusalDetectionConfig;
+  /** Service tier escalation configuration (opt-in).
+   *  When enabled, the multiplexer retries the same model at a higher-priority
+   *  tier before falling back to a different model on throttling errors. */
+  tierEscalation?: TierEscalationConfig;
+}
+
+/**
+ * Service tier types for Amazon Bedrock inference.
+ * Controls request prioritization and capacity allocation.
+ */
+export type ServiceTierType = 'reserved' | 'priority' | 'default' | 'flex';
+
+/**
+ * Configuration for service tier escalation.
+ * When enabled, the multiplexer retries the same model at a higher-priority
+ * tier before falling back to a different model on throttling errors.
+ */
+export interface TierEscalationConfig {
+  /** Enable service tier escalation on throttling errors */
+  enabled: boolean;
+  /**
+   * The tier to escalate to when a request is throttled at the default (Standard) tier.
+   * - "reserved": Use if the customer has a capacity reservation (separate quota, 99.5% uptime target).
+   * - "priority": Use if no reservation — requests are prioritized over Standard/Flex at a price premium.
+   */
+  escalationTier: 'reserved' | 'priority';
 }
 
 /**
@@ -220,6 +246,12 @@ export interface MultiplexerEvents {
   'refusal-detected': (modelId: string, confidence: number, responseText: string) => void;
   /** Emitted when refusal classification completes (regardless of result) */
   'refusal-classification': (modelId: string, isRefusal: boolean, confidence: number, latencyMs: number) => void;
+  /** Emitted when a request is escalated to a higher service tier after throttling */
+  'tier-escalation': (modelId: string, fromTier: ServiceTierType, toTier: ServiceTierType) => void;
+  /** Emitted when a tier-escalated request succeeds */
+  'tier-escalation-success': (modelId: string, tier: ServiceTierType) => void;
+  /** Emitted when a tier-escalated request fails */
+  'tier-escalation-failure': (modelId: string, tier: ServiceTierType, error: string) => void;
 }
 
 /**

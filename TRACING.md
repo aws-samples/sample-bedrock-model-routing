@@ -188,6 +188,19 @@ multiplexer.on('model-invocation-start', (modelId, requestId) => {
 multiplexer.on('model-invocation-complete', (modelId, requestId, latency) => {
   console.log(`Completed invocation: ${modelId} [${requestId}] in ${latency}ms`);
 });
+
+// Tier escalation events (when tierEscalation is enabled)
+multiplexer.on('tier-escalation', (modelId, fromTier, toTier) => {
+  console.log(`Tier escalation: ${modelId} ${fromTier} → ${toTier}`);
+});
+
+multiplexer.on('tier-escalation-success', (modelId, tier) => {
+  console.log(`Tier escalation succeeded: ${modelId} at ${tier}`);
+});
+
+multiplexer.on('tier-escalation-failure', (modelId, tier, error) => {
+  console.log(`Tier escalation failed: ${modelId} at ${tier} — ${error}`);
+});
 ```
 
 ## Performance Considerations

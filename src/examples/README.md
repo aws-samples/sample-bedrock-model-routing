@@ -23,7 +23,7 @@ npx tsx src/examples/01-basic-usage.ts
 |---|------|---------|
 | 01 | [basic-usage](01-basic-usage.ts) | Minimum setup: models → multiplexer → processRequest → response |
 | 02 | [weighted-selection](02-weighted-selection.ts) | How weights control traffic distribution across primary/fallback pools |
-| 03 | [failover-and-retry](03-failover-and-retry.ts) | Cross-model failover on rate limits, fail-fast semantics, caller-side retry for 503 |
+| 03 | [failover-and-retry](03-failover-and-retry.ts) | Cross-model failover on rate limits, fail-fast semantics, caller-side retry for 503, opt-in service tier escalation on throttling |
 | 04 | [circuit-breaker](04-circuit-breaker.ts) | Circuit breaker lifecycle (CLOSED → OPEN → HALF_OPEN), inspecting state |
 | 05 | [health-checks](05-health-checks.ts) | Health check API: simple probe, detailed status, per-model health, health formula |
 | 06 | [timeout-tuning](06-timeout-tuning.ts) | Configuring `defaultTimeoutMs`, using health metrics to calibrate |

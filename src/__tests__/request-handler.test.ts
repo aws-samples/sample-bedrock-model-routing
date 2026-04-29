@@ -5,7 +5,7 @@
 import { RequestHandler, RequestHandlerDelegate } from '../core/request-handler';
 import { MultiplexerError } from '../core/errors';
 import { BedrockModel } from '../models/bedrock-model';
-import { OutcomeType, ModelOutcome, SelectModelResponse } from '../types/index';
+import { OutcomeType, ModelOutcome, SelectModelResponse, TierEscalationConfig } from '../types/index';
 import { ConverseCommandOutput } from '@aws-sdk/client-bedrock-runtime';
 
 // Mock BedrockModel
@@ -54,7 +54,8 @@ describe('RequestHandler', () => {
       reportOutcome: jest.fn(),
       emitEvent: jest.fn(),
       classifyRefusal: jest.fn().mockResolvedValue(null),
-      refusalRetryEnabled: false
+      refusalRetryEnabled: false,
+      tierEscalationConfig: undefined
     };
   });
 
@@ -733,6 +734,389 @@ describe('RequestHandler', () => {
           expect(error).toBeInstanceOf(MultiplexerError);
           expect(error.code).toBe('NO_MODELS_AVAILABLE');
         }
+      });
+    });
+
+    describe('tier escalation', () => {
+      it('should not attempt tier escalation when not configured', async () => {
+        const rateLimitOutcome: ModelOutcome = {
+          modelId: 'model-1',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 50,
+          timestamp: new Date()
+        };
+
+        const rateLimitError = new Error('Rate limited');
+        rateLimitError.name = 'RateLimitError';
+        (rateLimitError as any).outcome = rateLimitOutcome;
+
+        const successResponse = makeOutput('Success!');
+        const successOutcome: ModelOutcome = {
+          modelId: 'model-2',
+          type: OutcomeType.SUCCESS,
+          latency: 100,
+          timestamp: new Date()
+        };
+
+        const secondModel = { ...mockModel, modelId: 'model-2' };
+
+        mockDelegate.selectModel
+          .mockResolvedValueOnce({ modelId: 'model-1', isFallback: false })
+          .mockResolvedValueOnce({ modelId: 'model-2', isFallback: false });
+
+        mockDelegate.getModel
+          .mockResolvedValueOnce(mockModel)
+          .mockResolvedValueOnce(secondModel as any);
+
+        mockModel.invoke.mockRejectedValueOnce(rateLimitError);
+        (secondModel as any).invoke = jest.fn().mockResolvedValue({
+          response: successResponse,
+          outcome: successOutcome
+        });
+
+        mockDelegate.tierEscalationConfig = undefined;
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(successResponse);
+        // Should NOT emit tier-escalation event
+        expect(mockDelegate.emitEvent).not.toHaveBeenCalledWith(
+          'tier-escalation', expect.anything(), expect.anything(), expect.anything()
+        );
+      });
+
+      it('should escalate to priority tier on throttling when configured', async () => {
+        const rateLimitOutcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 50,
+          timestamp: new Date()
+        };
+
+        const rateLimitError = new Error('Rate limited');
+        rateLimitError.name = 'RateLimitError';
+        (rateLimitError as any).outcome = rateLimitOutcome;
+
+        const escalatedResponse = makeOutput('Escalated success!');
+        const escalatedOutcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.SUCCESS,
+          latency: 80,
+          timestamp: new Date()
+        };
+
+        mockDelegate.selectModel.mockResolvedValue({ modelId: 'test-model', isFallback: false });
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+
+        // First invoke at default tier fails with rate limit
+        mockModel.invoke
+          .mockRejectedValueOnce(rateLimitError)
+          // Second invoke at priority tier succeeds
+          .mockResolvedValueOnce({ response: escalatedResponse, outcome: escalatedOutcome });
+
+        mockDelegate.tierEscalationConfig = { enabled: true, escalationTier: 'priority' };
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(escalatedResponse);
+
+        // Should have emitted tier-escalation event
+        expect(mockDelegate.emitEvent).toHaveBeenCalledWith(
+          'tier-escalation', 'test-model', 'default', 'priority'
+        );
+
+        // Should have emitted tier-escalation-success event
+        expect(mockDelegate.emitEvent).toHaveBeenCalledWith(
+          'tier-escalation-success', 'test-model', 'priority'
+        );
+
+        // Second invoke should have been called with 'priority' tier
+        expect(mockModel.invoke).toHaveBeenCalledTimes(2);
+        expect(mockModel.invoke.mock.calls[1][2]).toBe('priority');
+      });
+
+      it('should escalate to reserved tier when configured', async () => {
+        const rateLimitOutcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 50,
+          timestamp: new Date()
+        };
+
+        const rateLimitError = new Error('Rate limited');
+        rateLimitError.name = 'RateLimitError';
+        (rateLimitError as any).outcome = rateLimitOutcome;
+
+        const escalatedResponse = makeOutput('Reserved success!');
+        const escalatedOutcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.SUCCESS,
+          latency: 60,
+          timestamp: new Date()
+        };
+
+        mockDelegate.selectModel.mockResolvedValue({ modelId: 'test-model', isFallback: false });
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+
+        mockModel.invoke
+          .mockRejectedValueOnce(rateLimitError)
+          .mockResolvedValueOnce({ response: escalatedResponse, outcome: escalatedOutcome });
+
+        mockDelegate.tierEscalationConfig = { enabled: true, escalationTier: 'reserved' };
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(escalatedResponse);
+        expect(mockModel.invoke.mock.calls[1][2]).toBe('reserved');
+      });
+
+      it('should fall back to cross-model failover when escalation also fails', async () => {
+        const rateLimitOutcome: ModelOutcome = {
+          modelId: 'model-1',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 50,
+          timestamp: new Date()
+        };
+
+        const rateLimitError = new Error('Rate limited');
+        rateLimitError.name = 'RateLimitError';
+        (rateLimitError as any).outcome = rateLimitOutcome;
+
+        const escalationError = new Error('Still rate limited at priority');
+        escalationError.name = 'RateLimitError';
+        (escalationError as any).outcome = {
+          modelId: 'model-1',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 30,
+          timestamp: new Date()
+        };
+
+        const successResponse = makeOutput('Model 2 success!');
+        const successOutcome: ModelOutcome = {
+          modelId: 'model-2',
+          type: OutcomeType.SUCCESS,
+          latency: 100,
+          timestamp: new Date()
+        };
+
+        const secondModel = { ...mockModel, modelId: 'model-2' };
+
+        mockDelegate.selectModel
+          .mockResolvedValueOnce({ modelId: 'model-1', isFallback: false })
+          .mockResolvedValueOnce({ modelId: 'model-2', isFallback: false });
+
+        mockDelegate.getModel
+          .mockResolvedValueOnce(mockModel)
+          .mockResolvedValueOnce(mockModel) // For escalation attempt
+          .mockResolvedValueOnce(secondModel as any);
+
+        mockModel.invoke
+          .mockRejectedValueOnce(rateLimitError)   // Default tier fails
+          .mockRejectedValueOnce(escalationError);  // Priority tier also fails
+
+        (secondModel as any).invoke = jest.fn().mockResolvedValue({
+          response: successResponse,
+          outcome: successOutcome
+        });
+
+        mockDelegate.tierEscalationConfig = { enabled: true, escalationTier: 'priority' };
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(successResponse);
+
+        // Should have emitted tier-escalation-failure
+        expect(mockDelegate.emitEvent).toHaveBeenCalledWith(
+          'tier-escalation-failure', 'model-1', 'priority', expect.any(String)
+        );
+      });
+
+      it('should only attempt tier escalation once per model per request', async () => {
+        const rateLimitOutcome1: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 50,
+          timestamp: new Date()
+        };
+
+        const rateLimitError1 = new Error('Rate limited');
+        rateLimitError1.name = 'RateLimitError';
+        (rateLimitError1 as any).outcome = rateLimitOutcome1;
+
+        const escalationError = new Error('Still rate limited');
+        escalationError.name = 'RateLimitError';
+        (escalationError as any).outcome = {
+          modelId: 'test-model',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 30,
+          timestamp: new Date()
+        };
+
+        mockDelegate.selectModel
+          .mockResolvedValueOnce({ modelId: 'test-model', isFallback: false })
+          .mockResolvedValue({ modelId: null, isFallback: false });
+
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+
+        mockModel.invoke
+          .mockRejectedValueOnce(rateLimitError1)   // Default tier fails
+          .mockRejectedValueOnce(escalationError);   // Priority tier also fails
+
+        mockDelegate.tierEscalationConfig = { enabled: true, escalationTier: 'priority' };
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+
+        try {
+          await handler.process();
+          fail('Should have thrown');
+        } catch (error: any) {
+          expect(error).toBeInstanceOf(MultiplexerError);
+        }
+
+        // tier-escalation should only be emitted once for this model
+        const escalationCalls = mockDelegate.emitEvent.mock.calls.filter(
+          (c: any[]) => c[0] === 'tier-escalation'
+        );
+        expect(escalationCalls).toHaveLength(1);
+      });
+
+      it('should not attempt tier escalation for non-throttling errors', async () => {
+        const failFastOutcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.FAIL_FAST,
+          latency: 50,
+          timestamp: new Date()
+        };
+
+        const failFastError = new Error('Validation failed');
+        failFastError.name = 'FailFastError';
+        (failFastError as any).outcome = failFastOutcome;
+
+        mockDelegate.selectModel.mockResolvedValue({ modelId: 'test-model', isFallback: false });
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+        mockModel.invoke.mockRejectedValue(failFastError);
+
+        mockDelegate.tierEscalationConfig = { enabled: true, escalationTier: 'priority' };
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+
+        await expect(handler.process()).rejects.toBeDefined();
+
+        // Should NOT emit tier-escalation event for non-throttling errors
+        expect(mockDelegate.emitEvent).not.toHaveBeenCalledWith(
+          'tier-escalation', expect.anything(), expect.anything(), expect.anything()
+        );
+      });
+
+      it('should run refusal detection on escalated response', async () => {
+        const rateLimitOutcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 50,
+          timestamp: new Date()
+        };
+
+        const rateLimitError = new Error('Rate limited');
+        rateLimitError.name = 'RateLimitError';
+        (rateLimitError as any).outcome = rateLimitOutcome;
+
+        const escalatedResponse = makeOutput('Here is the answer.');
+        const escalatedOutcome: ModelOutcome = {
+          modelId: 'test-model',
+          type: OutcomeType.SUCCESS,
+          latency: 80,
+          timestamp: new Date()
+        };
+
+        mockDelegate.selectModel.mockResolvedValue({ modelId: 'test-model', isFallback: false });
+        mockDelegate.getModel.mockResolvedValue(mockModel);
+
+        mockModel.invoke
+          .mockRejectedValueOnce(rateLimitError)
+          .mockResolvedValueOnce({ response: escalatedResponse, outcome: escalatedOutcome });
+
+        mockDelegate.tierEscalationConfig = { enabled: true, escalationTier: 'priority' };
+        mockDelegate.refusalRetryEnabled = true;
+        mockDelegate.classifyRefusal.mockResolvedValue({
+          isRefusal: false,
+          confidence: 0.1,
+          latencyMs: 2
+        });
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(escalatedResponse);
+        expect(mockDelegate.classifyRefusal).toHaveBeenCalledWith('Here is the answer.');
+      });
+
+      it('should fall through to cross-model failover when escalated response is a refusal', async () => {
+        const rateLimitOutcome: ModelOutcome = {
+          modelId: 'model-1',
+          type: OutcomeType.RATE_LIMIT,
+          latency: 50,
+          timestamp: new Date()
+        };
+
+        const rateLimitError = new Error('Rate limited');
+        rateLimitError.name = 'RateLimitError';
+        (rateLimitError as any).outcome = rateLimitOutcome;
+
+        const refusalResponse = makeOutput("I can't help with that.");
+        const refusalOutcome: ModelOutcome = {
+          modelId: 'model-1',
+          type: OutcomeType.SUCCESS,
+          latency: 80,
+          timestamp: new Date()
+        };
+
+        const successResponse = makeOutput('Here is the answer.');
+        const successOutcome: ModelOutcome = {
+          modelId: 'model-2',
+          type: OutcomeType.SUCCESS,
+          latency: 100,
+          timestamp: new Date()
+        };
+
+        const secondModel = { ...mockModel, modelId: 'model-2' };
+
+        mockDelegate.selectModel
+          .mockResolvedValueOnce({ modelId: 'model-1', isFallback: false })
+          .mockResolvedValueOnce({ modelId: 'model-2', isFallback: false });
+
+        mockDelegate.getModel
+          .mockResolvedValueOnce(mockModel)
+          .mockResolvedValueOnce(mockModel) // For escalation attempt
+          .mockResolvedValueOnce(secondModel as any);
+
+        mockModel.invoke
+          .mockRejectedValueOnce(rateLimitError)
+          .mockResolvedValueOnce({ response: refusalResponse, outcome: refusalOutcome });
+
+        (secondModel as any).invoke = jest.fn().mockResolvedValue({
+          response: successResponse,
+          outcome: successOutcome
+        });
+
+        mockDelegate.tierEscalationConfig = { enabled: true, escalationTier: 'priority' };
+        mockDelegate.refusalRetryEnabled = true;
+        mockDelegate.classifyRefusal
+          .mockResolvedValueOnce({ isRefusal: true, confidence: 0.9, latencyMs: 3 })
+          .mockResolvedValueOnce({ isRefusal: false, confidence: 0.05, latencyMs: 2 });
+
+        const handler = new RequestHandler(makeInput('test'), mockDelegate, 3);
+        const result = await handler.process();
+
+        expect(result).toEqual(successResponse);
+
+        // Should have emitted refusal-detected for the escalated response
+        expect(mockDelegate.emitEvent).toHaveBeenCalledWith(
+          'refusal-detected', 'model-1', 0.9, "I can't help with that."
+        );
       });
     });
   });

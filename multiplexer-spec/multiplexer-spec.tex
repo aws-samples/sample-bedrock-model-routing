@@ -82,6 +82,8 @@ The multiplexer operates on the Amazon Bedrock Converse API request and response
 \cls{CircuitBreakerStatus} & Record & state, failureCount, successCount, lastOpenedAt, nextRetryAt \\
 \cls{RefusalDetectionConfig} & Record & Opt-in config: \fld{enabled}, \fld{modelPath}, \fld{confidenceThreshold}, \fld{retryOnRefusal} \\
 \cls{ClassificationResult} & Record & \fld{isRefusal} (boolean), \fld{confidence} (float 0--1), \fld{latencyMs} \\
+\cls{TierEscalationConfig} & Record & Opt-in config: \fld{enabled}, \fld{escalationTier} (``reserved'' or ``priority'') \\
+\cls{ServiceTierType} & Type alias & ``reserved'' $|$ ``priority'' $|$ ``default'' $|$ ``flex'' \\
 \bottomrule
 \end{tabular}
 
@@ -124,7 +126,7 @@ The Multiplexer is the top-level entry point. It owns two model pools (primary a
 \end{tabular}
 
 \medskip
-\noindent\textbf{Delegate interface} --- The Request Handler communicates with the Multiplexer through a narrow interface of six operations: \fn{selectModel}, \fn{getModel}, \fn{reportOutcome}, \fn{emitEvent}, \fn{classifyRefusal}, and the \fld{refusalRetryEnabled} flag. This decouples the retry logic from the orchestrator.
+\noindent\textbf{Delegate interface} --- The Request Handler communicates with the Multiplexer through a narrow interface of seven operations: \fn{selectModel}, \fn{getModel}, \fn{reportOutcome}, \fn{emitEvent}, \fn{classifyRefusal}, the \fld{refusalRetryEnabled} flag, and the \fld{tierEscalationConfig} property. This decouples the retry logic from the orchestrator.
 
 \medskip
 \noindent\textbf{Model selection algorithm} (\fn{selectFromPool}):
@@ -161,7 +163,7 @@ Each call to \fn{processRequest} creates a fresh Request Handler instance. It co
       \item If classified as refusal $\to$ emit \texttt{refusal-detected} event, report \op{Refusal} outcome, add model to skipped, increment retry, continue.
       \item If not refusal (or classifier disabled) $\to$ report \op{Success} outcome, return response.
     \end{enumerate}
-    \item On \op{RateLimit} error $\to$ report outcome, add model to skipped, increment retry, continue.
+    \item On \op{RateLimit} error $\to$ attempt tier escalation (step f); if not available or fails, report outcome, add model to skipped, increment retry, continue.
     \item On \op{CircuitOpen} error $\to$ report outcome, add model to skipped, increment retry, continue.
     \item On \op{FailFast} error $\to$ raise immediately (no retry).
     \item On unknown error $\to$ re-raise the original error as-is (no wrapping).
@@ -171,6 +173,22 @@ Each call to \fn{processRequest} creates a fresh Request Handler instance. It co
 
 \medskip
 \noindent\textbf{Refusal = recoverable outcome:} a detected refusal is treated identically to a \op{RateLimit} in the retry loop --- the model is skipped and a different model is selected immediately. The response is discarded. This allows the same prompt to be retried against a model that may provide a substantive answer. If all models refuse (or retries are exhausted), the last refusal response is \emph{not} returned --- instead, a \texttt{RETRIES\_EXHAUSTED} error is raised.
+
+\medskip
+\noindent\textbf{Service tier escalation} (opt-in, \fn{attemptTierEscalation}):
+
+When \fld{tierEscalation.enabled} is true, the Request Handler retries the \emph{same} model at a higher service tier before falling back to a different model on throttling errors. This adds a resilience dimension that exploits tier-level capacity before exhausting cross-model failover.
+
+\begin{enumerate}[nosep]
+  \item On \op{RateLimit} from a model at the default (Standard) tier, check if tier escalation is configured and has not already been attempted for this model in this request.
+  \item If available: emit \texttt{tier-escalation} event, call \fn{model.invoke}(input, serviceTier=escalationTier).
+  \item On success $\to$ run refusal detection (if enabled), emit \texttt{tier-escalation-success}, report outcome, return response.
+  \item On failure $\to$ emit \texttt{tier-escalation-failure}, fall through to cross-model failover (skip model, try next).
+\end{enumerate}
+
+\noindent\textbf{Escalation budget:} one attempt per model per request. Tier escalation does not consume the cross-model retry count. The \fld{tierEscalatedModels} set tracks which models have already attempted escalation for the current request.
+
+\noindent\textbf{Escalation tier:} determined by the \fld{tierEscalation.escalationTier} config --- ``reserved'' if the customer has a capacity reservation (separate quota, 99.5\% uptime target), ``priority'' if not (requests prioritized over Standard/Flex at a price premium).
 
 %% ============================================================
 \section*{{\color{modelgreen}Model Wrapper} \normalfont\small--- Amazon Bedrock model adapter}
@@ -183,7 +201,7 @@ Wraps an Amazon Bedrock runtime client for a single model. Owns: client instance
 \textbf{Operation} & \textbf{Inputs / Outputs} & \textbf{Semantics} \\
 \midrule
 \fn{construct} & config, client?, timeoutMs?, breaker?, clientConfig? & Create Bedrock runtime client with \fld{clientConfig} passthrough \\
-\fn{invoke} & input, abortSignal? $\to$ \{response, outcome\} & Stamp modelId, check breaker, execute with timeout \\
+\fn{invoke} & input, abortSignal?, serviceTier? $\to$ \{response, outcome\} & Stamp modelId (and optionally serviceTier), check breaker, execute with timeout \\
 \fn{invokeStream} & input, abortSignal? $\to$ streaming response & Streaming variant via Converse Stream API; returns raw SDK response \\
 \fn{destroy} & $\to$ void & Reset circuit breaker \\
 \bottomrule
@@ -193,7 +211,7 @@ Wraps an Amazon Bedrock runtime client for a single model. Owns: client instance
 \noindent\textbf{Invoke flow}:
 \begin{enumerate}[nosep]
   \item \fn{circuitBreaker.canExecute()} --- if false, raise \op{CircuitOpenError} with outcome.
-  \item Construct a Converse API call with $\{\ldots\text{input}, \text{modelId}\}$.
+  \item Construct a Converse API call with $\{\ldots\text{input}, \text{modelId}\}$. If \fld{serviceTier} is provided, stamp $\{\text{serviceTier}: \{\text{type}: \text{serviceTier}\}\}$ onto the request.
   \item \fn{executeWithTimeout}(operation, timeoutMs, abortSignal):
   \begin{itemize}[nosep]
     \item Race: operation vs.\ timeout timer vs.\ abort signal.
@@ -442,6 +460,9 @@ The Multiplexer publishes typed events via an observer pattern. Consumers subscr
 \texttt{model-invocation-complete} & (modelId, requestId, latencyMs) \\
 \texttt{refusal-detected} & (modelId, confidence, responseText) \\
 \texttt{refusal-classification} & (modelId, isRefusal, confidence, latencyMs) \\
+\texttt{tier-escalation} & (modelId, fromTier, toTier) \\
+\texttt{tier-escalation-success} & (modelId, tier) \\
+\texttt{tier-escalation-failure} & (modelId, tier, error) \\
 \bottomrule
 \end{tabular}
 
@@ -461,6 +482,7 @@ Three validation scopes, each producing a \cls{ValidationResult} (isValid flag +
 Model config & modelId required (non-empty string), weight $\in [0, 10000]$, isFallback required \\
 Multiplexer config & models $\ge 1$, unique IDs, $\ge 1$ primary, timeout $\in [1000, 300000]$\,ms, retries $\in [0, 10]$ \\
 Circuit breaker config & failureThreshold $\in [1, 100]$, recoveryTimeMs $\in [1000, 300000]$, successThreshold $\in [1, 20]$, failureWindowMs $\in [1000, 600000]$ \\
+Tier escalation config & \fld{enabled} required (boolean); when true, \fld{escalationTier} required (``reserved'' or ``priority'') \\
 \bottomrule
 \end{tabular}
 
@@ -506,8 +528,14 @@ End-to-end pseudocode for a single \fn{processRequest} call:
   //       -> updateModelStats(), recordLatency()
   //       -> healthCheckManager.recordSuccess/Failure()
   //       -> publish 'success' or 'error' event, publish 'stats' event
-  //    f. On RateLimit, CircuitOpen, or Refusal: skip model, retry with next
-  //    g. On FailFast: raise to caller immediately
+  //    f. On RateLimit: [if tierEscalation enabled] attempt tier escalation:
+  //       -> emit 'tier-escalation' event
+  //       -> model.invoke(input, serviceTier=escalationTier)
+  //       -> on success: emit 'tier-escalation-success', return response
+  //       -> on failure: emit 'tier-escalation-failure', skip model, retry next
+  //       [if not enabled or already attempted] skip model, retry with next
+  //    g. On CircuitOpen or Refusal: skip model, retry with next
+  //    h. On FailFast: raise to caller immediately
   // 4. Response returned to caller (or error raised)
 \end{lstlisting}
 

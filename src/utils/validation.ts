@@ -291,6 +291,47 @@ export class MultiplexerConfigValidator {
       }
     }
 
+    // Validate tierEscalation (optional)
+    if (cfg.tierEscalation !== undefined && cfg.tierEscalation !== null) {
+      if (typeof cfg.tierEscalation !== 'object' || Array.isArray(cfg.tierEscalation)) {
+        errors.push({
+          field: 'tierEscalation',
+          message: 'tierEscalation must be an object',
+          expected: 'object',
+          actual: Array.isArray(cfg.tierEscalation) ? 'array' : typeof cfg.tierEscalation
+        });
+      } else {
+        const te = cfg.tierEscalation as Record<string, unknown>;
+
+        if (te.enabled !== undefined && typeof te.enabled !== 'boolean') {
+          errors.push({
+            field: 'tierEscalation.enabled',
+            message: 'enabled must be a boolean',
+            expected: 'boolean',
+            actual: typeof te.enabled
+          });
+        }
+
+        if (te.enabled === true) {
+          const validTiers = ['reserved', 'priority'];
+          if (!te.escalationTier || typeof te.escalationTier !== 'string') {
+            errors.push({
+              field: 'tierEscalation.escalationTier',
+              message: 'escalationTier is required when tier escalation is enabled',
+              expected: '"reserved" | "priority"'
+            });
+          } else if (!validTiers.includes(te.escalationTier)) {
+            errors.push({
+              field: 'tierEscalation.escalationTier',
+              message: 'escalationTier must be "reserved" or "priority"',
+              expected: '"reserved" | "priority"',
+              actual: String(te.escalationTier)
+            });
+          }
+        }
+      }
+    }
+
     // Validate maxRetries
     if (cfg.maxRetries === undefined || cfg.maxRetries === null) {
       errors.push({

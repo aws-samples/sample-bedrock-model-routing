@@ -360,6 +360,47 @@ describe('BedrockModel', () => {
       expect(callArgs.modelId).toBe('amazon.nova-2-lite-v1:0');
       expect(callArgs.messages).toBeDefined();
     });
+
+    it('should stamp serviceTier onto the ConverseCommand when provided', async () => {
+      mockClient.send.mockResolvedValue(makeOutput('Hi'));
+      
+      const model = new BedrockModel(config);
+      await model.invoke(makeInput('test'), undefined, 'priority');
+      
+      const callArgs = ConverseCommand.mock.calls[0][0];
+      expect(callArgs.modelId).toBe('amazon.nova-2-lite-v1:0');
+      expect(callArgs.serviceTier).toEqual({ type: 'priority' });
+    });
+
+    it('should stamp reserved serviceTier onto the ConverseCommand', async () => {
+      mockClient.send.mockResolvedValue(makeOutput('Hi'));
+      
+      const model = new BedrockModel(config);
+      await model.invoke(makeInput('test'), undefined, 'reserved');
+      
+      const callArgs = ConverseCommand.mock.calls[0][0];
+      expect(callArgs.serviceTier).toEqual({ type: 'reserved' });
+    });
+
+    it('should not include serviceTier on the ConverseCommand when not provided', async () => {
+      mockClient.send.mockResolvedValue(makeOutput('Hi'));
+      
+      const model = new BedrockModel(config);
+      await model.invoke(makeInput('test'));
+      
+      const callArgs = ConverseCommand.mock.calls[0][0];
+      expect(callArgs.serviceTier).toBeUndefined();
+    });
+
+    it('should not include serviceTier when explicitly passed undefined', async () => {
+      mockClient.send.mockResolvedValue(makeOutput('Hi'));
+      
+      const model = new BedrockModel(config);
+      await model.invoke(makeInput('test'), undefined, undefined);
+      
+      const callArgs = ConverseCommand.mock.calls[0][0];
+      expect(callArgs.serviceTier).toBeUndefined();
+    });
   });
 
   describe('invokeStream', () => {
